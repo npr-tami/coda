@@ -4,7 +4,7 @@ The newest version is at the top.
 
 ## 0.1.5
 
-This is the last public release of Coda. The repository will be archived after it: it stays readable, but gets no more updates.
+This is the last public release for now. The repository will be archived after it. Coda keeps checking for updates, so if a new version comes out later, it still reaches you.
 
 - **New look**: the sidebar, the page and the side panel are rounded cards on a plain dark base, with the wallpaper softer inside them. Tabs are chips, search and buttons are rounded, and headings are no longer in capitals. In the light theme the title bar and Settings follow the theme too.
 - **Sort a list's songs** by title, artist, album, date added or length, or in reverse. Each list remembers its sort, and Play in order plays them as shown.

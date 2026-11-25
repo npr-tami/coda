@@ -5,7 +5,7 @@ written in Rust, with no embedded browser.
 
 [Download coda.exe](https://github.com/npr-tami/coda/releases/latest) · [What's new](CHANGELOG.md)
 
-0.1.5 is the last public release. This repository is archived and gets no more updates.
+0.1.5 is the last public release for now, and this repository is archived. Coda still checks for updates, so a later release would reach you.
 
 ## Features
 
