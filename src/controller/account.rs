@@ -385,7 +385,7 @@ impl Controller {
             self.links.knows(&p.uri)
                 || self.along.made.contains(&p.uri)
                 || channel.as_deref() == Some(p.uri.as_str())
-                || (p.editable && (p.name == crate::listen::CHANNEL_NAME || crate::listen::is_channel(&p.description)))
+                || (p.editable && (crate::listen::is_channel_name(&p.name) || crate::listen::is_channel(&p.description)))
         };
         self.playlists.iter().filter(|p| !link(p)).cloned().collect()
     }

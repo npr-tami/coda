@@ -93,7 +93,7 @@ fn main() -> Result<()> {
     let Some(mut instance) = single_instance::Instance::acquire(!minimized_arg) else {
         return Ok(());
     };
-    // Before anything makes Coda's data folders (the log file is in one): Truffle's data comes over.
+    // Before anything makes Coda's data folders (the log file is in one): the data of the app's old name comes over.
     let migration = config::migrate_from_old_name();
     init_logging();
     log::info!("coda {} starting", env!("CARGO_PKG_VERSION"));

@@ -13,10 +13,10 @@ pub mod links;
 
 use serde_json::Value;
 
-/// The channel playlist's name. Kept from the app's old name on purpose: it is stored in Spotify,
-/// and copies of the app from before the rename (also the user's own, on another PC) hide their
-/// channels by this name until the first state is written.
-pub const CHANNEL_NAME: &str = "Truffle · listen along";
+/// The channel playlist's name.
+pub const CHANNEL_NAME: &str = "Coda · listen along";
+/// How every channel's name ends, also the ones older copies of the app made under its old name.
+const CHANNEL_NAME_END: &str = " · listen along";
 /// A listener reads a channel this often, and friend activity this often.
 pub const CHANNEL_POLL_MS: u64 = 3_000;
 pub const FRIEND_POLL_MS: u64 = 5_000;
@@ -132,6 +132,11 @@ pub fn parse(description: &str) -> Option<HostState> {
 /// Whether a description is a listen-along channel's.
 pub fn is_channel(description: &str) -> bool {
     description.contains(TAG)
+}
+
+/// Whether a playlist's name is a channel's: this one's, or one an older copy of the app made.
+pub fn is_channel_name(name: &str) -> bool {
+    name.strip_suffix(CHANNEL_NAME_END).is_some_and(|first| !first.is_empty() && !first.contains(' '))
 }
 
 /// Whether `next` tells listeners something the state shared last doesn't: another song, a pause or
@@ -515,6 +520,15 @@ mod tests {
         assert_eq!(parse(&text), Some(state(1000, 2000, Mode::Pause)));
         assert!(is_channel(&text));
         assert!(!is_channel("Just a playlist"));
+    }
+
+    #[test]
+    fn channel_names_old_and_new() {
+        assert!(is_channel_name(CHANNEL_NAME));
+        assert!(is_channel_name("Oldname · listen along"));
+        assert!(!is_channel_name(" · listen along"));
+        assert!(!is_channel_name("My mix · listen along"));
+        assert!(!is_channel_name("Listen along"));
     }
 
     #[test]

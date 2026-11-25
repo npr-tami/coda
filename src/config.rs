@@ -40,7 +40,7 @@ pub fn test_root() -> PathBuf {
     std::env::var_os("CODA_TEST_DIR").filter(|v| !v.is_empty()).map(PathBuf::from).unwrap_or_else(std::env::temp_dir)
 }
 
-/// The app's old name. Its data folders (`%APPDATA%\truffle`, `%LOCALAPPDATA%\truffle`) are
+/// The app's old name. Its data folders (in `%APPDATA%` and `%LOCALAPPDATA%`) are
 /// copied to Coda's on the first start, so logins, likes, listen-along links and the queue carry
 /// over. The old folders stay as they are, as a backup.
 const OLD_NAME: &str = "truffle";
@@ -54,8 +54,8 @@ pub struct Migration {
     pub failed: Vec<String>,
 }
 
-/// On the first start of Coda: copies the old Truffle data folders (roaming and local) to Coda's,
-/// each only when Coda's doesn't exist yet and Truffle's does. Called before anything else
+/// On the first start of Coda: copies the old name's data folders (roaming and local) to Coda's,
+/// each only when Coda's doesn't exist yet and the old one does. Called before anything else
 /// touches the data folders (also before the log file is made).
 pub fn migrate_from_old_name() -> Migration {
     let mut done = Migration::default();
@@ -994,7 +994,7 @@ mod tests {
     #[test]
     fn old_data_is_copied_once_and_kept() {
         let root = migrate_root("copy");
-        let (old, new) = (root.join("truffle"), root.join("coda"));
+        let (old, new) = (root.join(OLD_NAME), root.join("coda"));
         std::fs::create_dir_all(old.join("config").join("librespot")).unwrap();
         std::fs::write(old.join("config").join("settings.json"), b"{\"volume\":0.5}").unwrap();
         std::fs::write(old.join("config").join("librespot").join("credentials.json"), b"login").unwrap();
@@ -1020,7 +1020,7 @@ mod tests {
     fn nothing_to_migrate_without_old_data() {
         let root = migrate_root("none");
         let mut skipped = Vec::new();
-        assert!(!migrate_dir(&root.join("truffle"), &root.join("coda"), &mut skipped).unwrap());
+        assert!(!migrate_dir(&root.join(OLD_NAME), &root.join("coda"), &mut skipped).unwrap());
         assert!(!root.join("coda").exists());
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -1028,7 +1028,7 @@ mod tests {
     #[test]
     fn a_copy_cut_off_halfway_is_redone() {
         let root = migrate_root("partial");
-        let (old, new) = (root.join("truffle"), root.join("coda"));
+        let (old, new) = (root.join(OLD_NAME), root.join("coda"));
         std::fs::create_dir_all(old.join("config")).unwrap();
         std::fs::write(old.join("config").join("state.json"), b"queue").unwrap();
         // What a copy killed halfway leaves behind.

@@ -4,10 +4,7 @@
 //! checksum. Nothing about the user or their music is sent (the request carries a plain
 //! "coda/<version>" user agent, no ids).
 //!
-//! The releases are looked for under the repo's new name first and its old one (Truffle) second,
-//! and a release's exe may be called coda.exe or (as the app's old name) truffle.exe, so copies
-//! from before and after the rename find each other's releases. Installing works from whatever the
-//! running exe is called.
+//! Installing works from whatever the running exe is called.
 //!
 //! Installing: the new exe is downloaded next to the running one (`coda.exe.new`) and checked
 //! (size, and SHA-256 when GitHub gives one). The running exe is then renamed to a backup
@@ -25,15 +22,10 @@ use anyhow::{Context, Result, anyhow, bail};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
-/// Where Coda's releases are, in the order asked: the repo's new name, then its old one (a repo
-/// that isn't there answers 404 and the next is asked; GitHub also forwards a renamed repo's old
-/// name to the new one).
-const RELEASES: [&str; 2] = [
-    "https://api.github.com/repos/npr-tami/coda/releases?per_page=20",
-    "https://api.github.com/repos/npr-tami/Truffle/releases?per_page=20",
-];
-/// The exe a release carries, in the order looked for: the new name, then the app's old one.
-const ASSETS: [&str; 2] = ["coda.exe", "truffle.exe"];
+/// Where Coda's releases are.
+const RELEASES: [&str; 1] = ["https://api.github.com/repos/npr-tami/coda/releases?per_page=20"];
+/// The exe a release carries.
+const ASSETS: [&str; 1] = ["coda.exe"];
 const USER_AGENT: &str = concat!("coda/", env!("CARGO_PKG_VERSION"));
 /// Once a day while Coda is open.
 pub const CHECK_EVERY_SECS: u64 = 24 * 60 * 60;
@@ -183,7 +175,7 @@ fn note_lines(body: &str) -> Vec<String> {
         .collect()
 }
 
-/// A release's exe: coda.exe, else truffle.exe (any case).
+/// A release's exe: coda.exe (any case).
 fn exe_asset(release: &ApiRelease) -> Option<&ApiAsset> {
     ASSETS.iter().find_map(|name| release.assets.iter().find(|a| a.name.eq_ignore_ascii_case(name)))
 }
@@ -533,19 +525,15 @@ mod tests {
     }
 
     #[test]
-    fn an_old_name_exe_is_found_too() {
-        // Releases made before the rename carry truffle.exe; newer ones carry both.
+    fn the_exe_is_found_in_any_case() {
         let json = r#"[
-            {"tag_name":"v0.1.4","assets":[{"name":"truffle.exe","size":4,"browser_download_url":"old4"},{"name":"coda.exe","size":5,"browser_download_url":"new4"}]},
-            {"tag_name":"v0.1.3","assets":[{"name":"Truffle.exe","size":3,"browser_download_url":"old3"}]},
+            {"tag_name":"v0.1.4","assets":[{"name":"notes.txt","size":4,"browser_download_url":"n4"},{"name":"Coda.EXE","size":5,"browser_download_url":"new4"}]},
             {"tag_name":"v0.1.2","assets":[{"name":"notes.txt","size":1,"browser_download_url":"n"}]}
         ]"#;
         let releases: Vec<ApiRelease> = serde_json::from_str(json).unwrap();
         let found = pick(&releases, "0.1.2").unwrap();
-        assert_eq!((found.version.as_str(), found.url.as_str(), found.size), ("0.1.4", "new4", 5), "coda.exe first");
-        let found = pick(&releases[1..], "0.1.2").unwrap();
-        assert_eq!((found.version.as_str(), found.url.as_str()), ("0.1.3", "old3"), "else truffle.exe");
-        assert!(pick(&releases[2..], "0.1.1").is_none(), "a release without either exe");
+        assert_eq!((found.version.as_str(), found.url.as_str(), found.size), ("0.1.4", "new4", 5));
+        assert!(pick(&releases[1..], "0.1.1").is_none(), "a release without the exe");
     }
 
     fn run<T>(f: impl std::future::Future<Output = T>) -> T {
@@ -553,18 +541,19 @@ mod tests {
     }
 
     #[test]
-    fn the_old_repo_is_asked_when_the_new_one_isnt_there() {
+    fn the_next_url_is_asked_when_one_isnt_there() {
+        const URLS: [&str; 2] = ["https://example.test/first", "https://example.test/second"];
         let asked = Mutex::new(Vec::new());
-        let list = r#"[{"tag_name":"v9.0.0","assets":[{"name":"truffle.exe","size":2,"browser_download_url":"t"}]}]"#;
+        let list = r#"[{"tag_name":"v9.0.0","assets":[{"name":"coda.exe","size":2,"browser_download_url":"t"}]}]"#;
         let get = |url: &'static str| {
             asked.lock().unwrap().push(url);
-            let answer = if url.contains("/coda/") { (404, String::new()) } else { (200, list.to_owned()) };
+            let answer = if url.ends_with("/first") { (404, String::new()) } else { (200, list.to_owned()) };
             async move { Ok(answer) }
         };
-        let releases = run(releases_from(&RELEASES, get)).unwrap();
-        assert_eq!(*asked.lock().unwrap(), RELEASES.to_vec());
+        let releases = run(releases_from(&URLS, get)).unwrap();
+        assert_eq!(*asked.lock().unwrap(), URLS.to_vec());
         assert_eq!(pick(&releases, OURS).unwrap().url, "t");
-        assert!(RELEASES[0].contains("/npr-tami/coda/") && RELEASES[1].contains("/npr-tami/Truffle/"));
+        assert!(RELEASES[0].contains("/npr-tami/coda/"));
     }
 
     #[test]
@@ -594,13 +583,13 @@ mod tests {
     }
 
     #[test]
-    fn an_exe_installed_under_its_old_name_keeps_that_name() {
-        // A coda.exe that an old updater put in place as truffle.exe: the download and the
-        // backup go by the running exe's own name.
+    fn an_exe_under_another_name_keeps_that_name() {
+        // A coda.exe saved under another name: the download and the backup go by the running
+        // exe's own name.
         let dir = Path::new("X:/apps");
-        let exe = dir.join("truffle.exe");
-        assert_eq!(download_path(&exe), dir.join("truffle.exe.new"));
-        assert_eq!(backup_path(&exe, "0.1.3", |_| false), dir.join("truffle.exe.old-0.1.3"));
+        let exe = dir.join("music.exe");
+        assert_eq!(download_path(&exe), dir.join("music.exe.new"));
+        assert_eq!(backup_path(&exe, "0.1.3", |_| false), dir.join("music.exe.old-0.1.3"));
         assert_eq!(download_path(&dir.join("coda.exe")), dir.join("coda.exe.new"));
     }
 

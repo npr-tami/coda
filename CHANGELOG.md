@@ -9,7 +9,7 @@ The newest version is at the top.
 
 ## 0.1.3 · 16/11/2026
 
-- Truffle is now called Coda: new name, new icon and logo. Your settings, sign-ins, likes, listen-along links and queue come over by themselves, and updates keep working.
+- New name: Coda, with a new icon and logo. Your settings, sign-ins, likes, listen-along links and queue come over by themselves, and updates keep working.
 
 ## 0.1.2 · 14/11/2026
 
