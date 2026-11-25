@@ -525,6 +525,20 @@ mod tests {
     }
 
     #[test]
+    fn nothing_newer_is_no_update_and_a_later_release_is_found() {
+        // An archived repo still lists its releases: with none above this version, no update.
+        let json = r#"[{"tag_name":"v0.1.5","assets":[{"name":"coda.exe","size":5,"browser_download_url":"now"}]}]"#;
+        let releases: Vec<ApiRelease> = serde_json::from_str(json).unwrap();
+        assert!(pick(&releases, "0.1.5").is_none());
+        assert!(pick(&[], "0.1.5").is_none());
+        // A release made later is found.
+        let json = r#"[{"tag_name":"v0.1.6","assets":[{"name":"coda.exe","size":6,"browser_download_url":"later"}]},{"tag_name":"v0.1.5","assets":[]}]"#;
+        let releases: Vec<ApiRelease> = serde_json::from_str(json).unwrap();
+        let found = pick(&releases, "0.1.5").unwrap();
+        assert_eq!((found.version.as_str(), found.url.as_str()), ("0.1.6", "later"));
+    }
+
+    #[test]
     fn the_exe_is_found_in_any_case() {
         let json = r#"[
             {"tag_name":"v0.1.4","assets":[{"name":"notes.txt","size":4,"browser_download_url":"n4"},{"name":"Coda.EXE","size":5,"browser_download_url":"new4"}]},
