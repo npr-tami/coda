@@ -2,7 +2,7 @@
 
 The newest version is at the top.
 
-## 0.1.5
+## 0.1.5 · 25/11/2026
 
 This is the last public release for now. The repository will be archived after it. Coda keeps checking for updates, so if a new version comes out later, it still reaches you.
 
