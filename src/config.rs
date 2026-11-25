@@ -236,6 +236,117 @@ pub enum FriendsLayout {
     Switch,
 }
 
+/// Which line Discord's member list shows after the name ("Listening to …").
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DiscordShows {
+    /// "Listening to coda" (the application's name).
+    App,
+    /// The top line (the song, unless changed).
+    #[default]
+    Song,
+    /// The bottom line (the artist, unless changed).
+    Artist,
+}
+
+/// What the Discord status does while the music is paused.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DiscordPaused {
+    /// Take the status away until the music plays again.
+    #[default]
+    Clear,
+    /// Keep the song on show, marked "Paused", without a progress bar.
+    Keep,
+}
+
+/// The big picture on the Discord status.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DiscordPicture {
+    #[default]
+    Cover,
+    /// The Discord application's own picture (coda's icon, for coda's application).
+    AppIcon,
+}
+
+/// How the Discord status looks. The defaults look exactly like the status always did.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DiscordLook {
+    /// The two lines, with {title} {artist} {album} {playlist} filled in.
+    pub top: String,
+    pub bottom: String,
+    pub shows: DiscordShows,
+    pub paused: DiscordPaused,
+    pub progress: bool,
+    pub picture: DiscordPicture,
+    /// A small play or pause sign on the album cover.
+    pub badge: bool,
+    /// An "Open on Spotify" link button under the status (a plain link: nothing to join).
+    pub button: bool,
+}
+
+impl DiscordLook {
+    pub const TOP: &str = "{title}";
+    pub const BOTTOM: &str = "{artist}";
+}
+
+impl Default for DiscordLook {
+    fn default() -> Self {
+        Self {
+            top: Self::TOP.to_owned(),
+            bottom: Self::BOTTOM.to_owned(),
+            shows: DiscordShows::default(),
+            paused: DiscordPaused::default(),
+            progress: true,
+            picture: DiscordPicture::default(),
+            badge: false,
+            button: false,
+        }
+    }
+}
+
+/// What a list page's songs are sorted by.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SortBy {
+    /// The list's own order (a playlist's, newest first for Liked Songs, an album's tracks).
+    #[default]
+    Own,
+    Title,
+    Artist,
+    Album,
+    Added,
+    Length,
+}
+
+impl SortBy {
+    pub const ALL: [SortBy; 6] = [SortBy::Own, SortBy::Title, SortBy::Artist, SortBy::Album, SortBy::Added, SortBy::Length];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            SortBy::Own => "Own order",
+            SortBy::Title => "Title",
+            SortBy::Artist => "Artist",
+            SortBy::Album => "Album",
+            SortBy::Added => "Date added",
+            SortBy::Length => "Length",
+        }
+    }
+}
+
+/// A list page's sort: by what, and whether reversed.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ListSort {
+    pub by: SortBy,
+    pub reverse: bool,
+}
+
+impl ListSort {
+    /// The list's own order, as it is.
+    pub fn is_own(self) -> bool {
+        self == ListSort::default()
+    }
+}
+
 /// A list page's banner: the picture, and how it sits (moved and zoomed by the user).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(from = "BannerSaved")]
@@ -558,6 +669,10 @@ pub struct Settings {
     /// Discord application id (from discord.com/developers/applications). Discord shows
     /// "Listening to <song>" and the app's name on the profile.
     pub discord_app_id: Option<String>,
+    /// How the Discord status looks.
+    pub discord_look: DiscordLook,
+    /// "Hide from Discord": the status is taken away for now, with the setting left on.
+    pub discord_hidden: bool,
 
     // --- Last.fm (controller-owned: changed through Commands) ---
     /// Scrobble plays and show "now playing" on Last.fm.
@@ -589,19 +704,24 @@ pub struct Settings {
     pub library_view: LibraryView,
     /// Height of the playlist header.
     pub hero_size: HeroSize,
-    /// Widths of the playlists panel and the record panel the user last dragged them to
-    /// (logical points); `None` until first resized.
+    /// Widths of the sidebar (240-420) and the side panel (260-480) the user last dragged their edges
+    /// to (logical points); `None` for the defaults (300 and 340). A window too small for them draws
+    /// them narrower but never changes these.
     pub library_width: Option<f32>,
     pub deck_width: Option<f32>,
     /// Banner pictures for list pages, shown only in Coda, by `Source::cache_key`.
     pub banners: std::collections::BTreeMap<String, Banner>,
+    /// How each list page's songs are sorted (by `Source::cache_key`; none: the list's own order).
+    /// Only how Coda shows them: the list on Spotify keeps its order.
+    pub list_sorts: std::collections::BTreeMap<String, ListSort>,
     /// The Settings window's size (points), once resized; it opens over the middle of Coda.
     pub settings_size: Option<[f32; 2]>,
     /// The app icon's style.
     pub app_icon: AppIcon,
-    /// At wide widths the sidebar is folded to the 56 strip (Ctrl+B).
+    /// The sidebar is folded to the 56 strip (Ctrl+B, or its edge dragged in), at every width.
     pub sidebar_folded: bool,
-    /// At medium widths (760-1199) the side panel is open (Ctrl+P).
+    /// No longer read: the side panel is open or closed at every width by `show_rules_panel`. Kept so
+    /// older builds reading this file find it.
     pub panel_medium: bool,
     /// The side panel shows the turntable (Ctrl+D).
     pub panel_record: bool,
@@ -696,6 +816,8 @@ impl Default for Settings {
             start_with_windows: false,
             discord_status: false,
             discord_app_id: None,
+            discord_look: DiscordLook::default(),
+            discord_hidden: false,
             lastfm_enabled: true,
             lastfm_api_key: None,
             lastfm_api_secret: None,
@@ -719,6 +841,7 @@ impl Default for Settings {
             library_width: None,
             deck_width: None,
             banners: std::collections::BTreeMap::new(),
+            list_sorts: std::collections::BTreeMap::new(),
             settings_size: None,
             app_icon: AppIcon::default(),
             sidebar_folded: false,

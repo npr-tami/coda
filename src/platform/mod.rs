@@ -20,11 +20,11 @@ use std::sync::{Mutex, PoisonError};
 use anyhow::Result;
 use souvlaki::{MediaControlEvent, MediaPosition, SeekDirection};
 
-use self::discord::{DiscordHandle, DiscordState, Presence, validate_app_id};
+use self::discord::{DiscordHandle, DiscordState, Presence, Song, presence_for, validate_app_id};
 use self::media::Media;
 use self::state::{Status, Tracker, seek_target, timestamps, unix_now_ms};
 use self::tray::Tray;
-use crate::config::Settings;
+use crate::config::{DiscordLook, Settings};
 use crate::icon::IconStyle;
 use crate::model::{Command, PlaybackState};
 
@@ -37,6 +37,8 @@ pub enum PlatformAction {
     ShowWindow,
     /// Switch between the full window and the mini player.
     ToggleMiniPlayer,
+    /// Tray menu "Hide from Discord": take the Discord status away for now, or show it again.
+    ToggleHideDiscord,
     /// Quit for real (tray menu "Quit").
     Quit,
 }
@@ -84,6 +86,8 @@ struct Applied {
     tray_icon: bool,
     discord_status: bool,
     discord_app_id: Option<String>,
+    discord_look: DiscordLook,
+    discord_hidden: bool,
 }
 
 impl Applied {
@@ -93,6 +97,8 @@ impl Applied {
             tray_icon: settings.tray_icon,
             discord_status: settings.discord_status,
             discord_app_id: settings.discord_app_id.clone(),
+            discord_look: settings.discord_look.clone(),
+            discord_hidden: settings.discord_hidden,
         }
     }
 }
@@ -112,6 +118,11 @@ pub struct Platform {
     tray: Option<Tray>,
     discord: DiscordSlot,
     applied: Option<Applied>,
+    /// How the Discord status looks, and whether it is hidden for now.
+    discord_look: DiscordLook,
+    discord_hidden: bool,
+    /// The name of the list playing (for a {playlist} line).
+    playlist: String,
     /// The tray icon's style (a new tray icon starts in it).
     icon_style: IconStyle,
 }
@@ -137,6 +148,9 @@ impl Platform {
             tray: None,
             discord: DiscordSlot::Off,
             applied: None,
+            discord_look: settings.discord_look.clone(),
+            discord_hidden: settings.discord_hidden,
+            playlist: String::new(),
             icon_style: crate::icon::style_for(settings.app_icon, windows_taskbar_dark().unwrap_or(true)),
         };
         platform.apply_settings(settings);
@@ -175,7 +189,16 @@ impl Platform {
             log::info!("tray icon off");
         }
 
+        let look_changed = (&wanted.discord_look, wanted.discord_hidden) != (&self.discord_look, self.discord_hidden);
+        self.discord_look = wanted.discord_look.clone();
+        self.discord_hidden = wanted.discord_hidden;
+        if let Some(tray) = self.tray.as_mut() {
+            tray.set_discord(wanted.discord_status, wanted.discord_hidden);
+        }
         self.apply_discord(wanted.discord_status, wanted.discord_app_id.as_deref());
+        if look_changed && let DiscordSlot::Running(discord) = &self.discord {
+            discord.show(self.presence());
+        }
         self.applied = Some(wanted);
     }
 
@@ -301,21 +324,40 @@ impl Platform {
         };
     }
 
-    /// What Discord should show now: the song while playing, nothing when paused or stopped.
+    /// What Discord should show now: the song while playing; when paused, nothing or the song
+    /// marked "Paused" (as set); nothing when stopped or hidden from Discord.
     fn presence(&self) -> Option<Presence> {
-        if self.tracker.status != Status::Playing {
+        if self.discord_hidden || self.tracker.status == Status::Stopped {
             return None;
         }
         let track = self.tracker.track.as_ref()?;
-        let (start_ms, end_ms) = timestamps(self.tracker.anchor_started_unix_ms, track.duration_ms);
-        Some(Presence {
-            title: track.title.clone(),
-            artist: track.artist.clone(),
-            album: track.album.clone(),
-            cover: track.cover.clone(),
-            start_ms,
-            end_ms,
-        })
+        let song = Song {
+            uri: &track.uri,
+            title: &track.title,
+            artist: &track.artist,
+            album: &track.album,
+            playlist: &self.playlist,
+            cover: track.cover.as_deref(),
+        };
+        let timing = timestamps(self.tracker.anchor_started_unix_ms, track.duration_ms);
+        presence_for(&song, self.tracker.status == Status::Playing, timing, &self.discord_look)
+    }
+
+    /// Whether the Discord status uses the playing list's name (then the UI passes it on with
+    /// [`Platform::set_playlist`]).
+    pub fn wants_playlist(&self) -> bool {
+        matches!(self.discord, DiscordSlot::Running(_))
+            && (self.discord_look.top.contains("{playlist}") || self.discord_look.bottom.contains("{playlist}"))
+    }
+
+    /// The name of the list playing, for a {playlist} line.
+    pub fn set_playlist(&mut self, name: &str) {
+        if self.playlist != name {
+            name.clone_into(&mut self.playlist);
+            if let DiscordSlot::Running(discord) = &self.discord {
+                discord.show(self.presence());
+            }
+        }
     }
 }
 

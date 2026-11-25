@@ -264,7 +264,7 @@ impl CodaApp {
                 choice = Choice::Later;
             }
             ui.add_space(12.0);
-            egui::Frame::new().fill(p.main_bg).stroke(Stroke::new(1.0, p.border)).corner_radius(CornerRadius::same(8)).inner_margin(12).show(ui, |ui| {
+            egui::Frame::new().fill(super::kit::card_bg(&p)).corner_radius(CornerRadius::same(super::kit::CARD_RADIUS)).inner_margin(12).show(ui, |ui| {
                 ui.set_width(ui.available_width());
                 egui::ScrollArea::vertical().max_height(220.0).auto_shrink([false, true]).show(ui, |ui| {
                     for (k, notes) in found.notes.iter().enumerate() {
@@ -414,7 +414,7 @@ impl CodaApp {
         if self.update_ask() != Ask::Pill || self.updater.install.is_some() {
             return right;
         }
-        let p = self.palette.on_dark();
+        let p = self.palette;
         let galley = ui.painter().layout_no_wrap("Update ready".to_owned(), medium(12.0), p.text);
         let w = 12.0 + 7.0 + 7.0 + galley.size().x + 12.0;
         let rect = Rect::from_min_size(pos2(right - w, cy - 15.0), vec2(w, 30.0));

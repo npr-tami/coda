@@ -176,12 +176,31 @@ pub(super) fn nav_row(ui: &Ui, p: &Palette, row: Rect, icon: &str, name: &str, o
     resp
 }
 
+/// The narrowest a sleeve's cell gets in the sidebar: 4 across at 300, 5 at 420.
+pub(super) const SIDEBAR_CELL: f32 = 68.0;
+
+/// A sleeve grid `width` wide with cells at least `min_cell` wide: how many across (at least 3), and
+/// each cell's width and height (2 apart, 10 in from either side).
+pub(super) fn grid_cells(width: f32, min_cell: f32) -> (usize, f32, f32) {
+    let cols = (((width - 20.0) / min_cell).floor() as usize).max(3);
+    let cell_w = ((width - 20.0) - 2.0 * (cols - 1) as f32) / cols as f32;
+    // The sleeve, then the name and the count under it: 114 for a 92 cell, as in the prototype.
+    (cols, cell_w, sleeve_side(cell_w) + 52.0)
+}
+
+/// The sleeve's side in a cell `cell_w` wide: 62 in a 92 cell, bigger in wider ones (96 at most),
+/// two thirds of a narrower one (so its record still peeks out within the cell).
+pub(super) fn sleeve_side(cell_w: f32) -> f32 {
+    if cell_w >= 92.0 { (62.0 + (cell_w - 92.0)).min(96.0) } else { (cell_w * 0.674).round().max(40.0) }
+}
+
 impl CodaApp {
     pub(super) fn sidebar_full(&mut self, ui: &mut Ui) {
         let p = self.palette;
         let r = ui.max_rect();
-        // Nav rows: 34 tall, 2 apart, 10 in from the top and 8 from the sides.
-        let mut y = r.top() + 10.0;
+        // Nav rows: 34 tall, 2 apart, 12 in from the top (Home's name lines up with the page hero's
+        // first words and the side panel's head) and 8 from the sides.
+        let mut y = r.top() + 12.0;
         let home = self.home_shown();
         let (albums_on, artists_on) = (self.middle_tab == MiddleTab::Albums, self.middle_tab == MiddleTab::Artists);
         for (icon, name, on) in [("home", "Home", home), ("album", "Albums", albums_on), ("artist", "Artists", artists_on)] {
@@ -204,7 +223,7 @@ impl CodaApp {
         let list = Rect::from_min_max(pos2(r.left(), y), r.max);
         let mut child = ui.new_child(egui::UiBuilder::new().id_salt("side-scroll").max_rect(list));
         child.set_clip_rect(list.intersect(ui.clip_rect()));
-        let lists = egui::ScrollArea::vertical().id_salt("side-scroll-area").auto_shrink(false).show(&mut child, |ui| self.sidebar_lists(ui));
+        let lists = egui::ScrollArea::vertical().id_salt("side-scroll-area").auto_shrink(false).show(&mut child, |ui| self.sidebar_lists(ui, SIDEBAR_CELL));
         // The fade at the bottom (30 px to the sidebar's grey), when the lists go on past it.
         if lists.content_size.y > lists.inner_rect.height() + 0.5 {
             let fade = Rect::from_min_max(pos2(r.left(), r.bottom() - 30.0), r.max);
@@ -212,9 +231,13 @@ impl CodaApp {
         }
     }
 
-    pub(super) fn sidebar_lists(&mut self, ui: &mut Ui) {
+    /// The Pinned and Playlists sections, with sleeves in a grid of cells at least `min_cell` wide (and
+    /// at least 3 across).
+    pub(super) fn sidebar_lists(&mut self, ui: &mut Ui, min_cell: f32) {
         let p = self.palette;
         let width = ui.available_width();
+        // Songs dragged to its top or bottom edge scroll it, to reach the playlists out of view.
+        super::dnd::edge_scroll(ui);
         let left = ui.max_rect().left();
         let mut y = ui.cursor().top();
         let needle = fold(self.playlist_search.trim());
@@ -244,7 +267,7 @@ impl CodaApp {
         if !pins.is_empty() {
             y = self.side_section(ui, left, width, y, "Pinned", |_, _, _| false);
             let edit = self.pin_edit.on;
-            y = self.sleeve_grid_fin(ui, left, width, y, &pins, edit);
+            y = self.sleeve_grid_fin(ui, left, width, y, &pins, edit, min_cell);
         } else {
             self.pin_edit.on = false;
         }
@@ -259,7 +282,9 @@ impl CodaApp {
         let grid_btn = list_btn.translate(vec2(-34.0, 0.0));
         let search = Rect::from_min_max(tools.min, pos2(grid_btn.left() - 4.0, tools.bottom()));
         let mut text = std::mem::take(&mut self.playlist_search);
-        let sb = fin::search_box(ui, &p, search, Id::new(super::PLAYLIST_SEARCH_ID), &mut text, "Filter playlists", "Ctrl+L");
+        // A narrow sidebar leaves out the key hint, so the words still fit.
+        let (hint, key) = if search.width() < 180.0 { ("Filter", "") } else { ("Filter playlists", "Ctrl+L") };
+        let sb = fin::search_box(ui, &p, search, Id::new(super::PLAYLIST_SEARCH_ID), &mut text, hint, key);
         let mut changed = text != self.playlist_search;
         if sb.resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Escape)) && !text.is_empty() {
             text.clear();
@@ -311,7 +336,7 @@ impl CodaApp {
         } else {
             // What has just come fades in.
             let was = motion::content_in(ui, Id::new("playlists"));
-            y = if sleeves { self.sleeve_grid_fin(ui, left, width, y, &rest, false) } else { self.sleeve_list_fin(ui, left, width, y, &rest) };
+            y = if sleeves { self.sleeve_grid_fin(ui, left, width, y, &rest, false, min_cell) } else { self.sleeve_list_fin(ui, left, width, y, &rest) };
             ui.set_opacity(was);
         }
         // Room under the last row to bring it out from under the fade, only when the lists are taller
@@ -321,13 +346,13 @@ impl CodaApp {
         ui.allocate_space(vec2(width, (height + room).max(0.0)));
     }
 
-    /// A section heading (`.sec`): 30 tall, small spaced capitals, and whatever goes on its right.
+    /// A section heading (`.sec`): 30 tall, 12 px semibold words as written, and whatever goes on its right.
     fn side_section(&mut self, ui: &mut Ui, left: f32, width: f32, y: f32, title: &str, right: impl FnOnce(&mut Self, &mut Ui, Rect) -> bool) -> f32 {
         let p = self.palette;
         let sec = Rect::from_min_size(pos2(left, y), vec2(width, 30.0));
-        let g = fin::spaced(ui, &title.to_uppercase(), bold(10.5), p.text_weak, 0.95);
+        let g = fin::spaced(ui, title, bold(12.0), p.text, 0.0);
         let gh = g.size().y;
-        ui.painter().galley(pos2(sec.left() + 16.0, sec.center().y - gh / 2.0), g, p.text_weak);
+        ui.painter().galley(pos2(sec.left() + 16.0, sec.center().y - gh / 2.0), g, p.text);
         if title == "Pinned" {
             // Edit: the grid's edit mode, where sleeves drag to new places and the × unpins; Done ends it.
             let editing = self.pin_edit.on;
@@ -359,13 +384,18 @@ impl CodaApp {
         });
         // The pill slides to the one picked, under the words.
         let chosen = tabs.iter().position(|&(filter, _)| self.prefs.playlist_filter == filter).map(|k| (k, rects[k]));
+        // Islands' chips: the picked one a light pill with dark words.
         motion::marker(ui.ctx(), Id::new("mt3-pill"), sec.right_top(), chosen, motion::TAB, |r, a| {
-            ui.painter().rect_filled(r, CornerRadius::same(5), p.widget_bg.gamma_multiply(a));
+            ui.painter().rect_filled(r, CornerRadius::same((r.height() / 2.0) as u8), p.chip_on_bg().gamma_multiply(a));
         });
         for (((filter, name), g), rect) in tabs.into_iter().zip(galleys).zip(rects) {
             let on = self.prefs.playlist_filter == filter;
             let resp = ui.interact(rect, Id::new(("mt3", name)), Sense::click()).on_hover_cursor(CursorIcon::PointingHand);
-            let color = motion::color(ui.ctx(), resp.id, fin::tab_ink(&p, on, resp.hovered()), motion::HOVER);
+            if !on && resp.hovered() {
+                ui.painter().rect_filled(rect, CornerRadius::same((rect.height() / 2.0) as u8), p.hover_bg);
+            }
+            let ink = if on { p.chip_on_ink() } else { fin::tab_ink(&p, false, resp.hovered()) };
+            let color = motion::color(ui.ctx(), resp.id, ink, motion::HOVER);
             ui.painter().galley_with_override_text_color(pos2(rect.left() + 8.0, rect.top() + 3.0), g, color);
             if resp.clicked() && !on {
                 self.prefs.playlist_filter = filter;
@@ -377,16 +407,13 @@ impl CodaApp {
         changed
     }
 
-    /// Sleeves in three columns (`.pgrid` / `.pc`): a 62 sleeve, the name and the number of songs. The
+    /// Sleeves in columns (`.pgrid` / `.pc`): a sleeve (62 in a 92 cell), the name and the number of songs. The
     /// Pinned grid in its edit mode (`edit`): a dragged sleeve follows the mouse, lifted, and the others
     /// slide out of its way; letting go keeps that order. Liked Songs stays first while it is pinned.
-    fn sleeve_grid_fin(&mut self, ui: &mut Ui, left: f32, width: f32, y: f32, items: &[Sleeve], edit: bool) -> f32 {
+    fn sleeve_grid_fin(&mut self, ui: &mut Ui, left: f32, width: f32, y: f32, items: &[Sleeve], edit: bool, min_cell: f32) -> f32 {
         let inner_left = left + 10.0;
-        // Three across in the sidebar; as many of about 112 as fit on the narrow Library page.
-        let cols = (((width - 20.0) / 112.0).floor() as usize).max(3);
-        let cell_w = ((width - 20.0) - 2.0 * (cols - 1) as f32) / cols as f32;
-        // Measured from the prototype: rows 116 apart (2 of them the gap).
-        let cell_h = 114.0 + (cell_w - 92.0).max(0.0);
+        // As many cells at least `min_cell` wide as fit (4 across the 300 sidebar), at least 3.
+        let (cols, cell_w, cell_h) = grid_cells(width, min_cell);
         let slots: Vec<Rect> = (0..items.len())
             .map(|i| Rect::from_min_size(pos2(inner_left + (i % cols) as f32 * (cell_w + 2.0), y + (i / cols) as f32 * (cell_h + 2.0)), vec2(cell_w, cell_h)))
             .collect();
@@ -496,8 +523,7 @@ impl CodaApp {
     /// [`OnTop`], and the cover's rect.
     fn sleeve_body(&mut self, ui: &Ui, cell: Rect, s: &Sleeve, open: bool, playing: bool, hovered: bool) -> (Option<Raised>, Rect) {
         let p = self.palette;
-        // 62 in the sidebar's cells (92 wide); bigger in wider cells.
-        let side = (62.0 + (cell.width() - 92.0).max(0.0)).min(96.0);
+        let side = sleeve_side(cell.width());
         let cover = Rect::from_min_size(pos2(cell.left() + 7.0, cell.top() + 7.0), vec2(side, side));
         let raised = self.paint_sleeve(ui, cover, s, playing, hovered, 0.20);
         let text_w = cell.width() - 7.0 - 4.0;
@@ -508,7 +534,11 @@ impl CodaApp {
             // The number rolls when it changes; " songs" follows it.
             let at = pos2(cover.left(), cover.bottom() + 6.0 + 1.0 + nh + 1.0);
             let n = motion::count(ui.painter(), Id::new(("sleeve-count", &s.source)), c as usize, at, Align2::LEFT_TOP, |n| ui.painter().layout_no_wrap(fmt_thousands(n), regular(10.5), p.text_weak));
-            ui.painter().text(pos2(n.right(), at.y), Align2::LEFT_TOP, " songs", regular(10.5), p.text_weak);
+            // " songs" when it fits in the cell (a big number in a small cell goes without it).
+            let songs = ui.painter().layout_no_wrap(" songs".to_owned(), regular(10.5), p.text_weak);
+            if n.right() + songs.size().x <= cell.right() {
+                ui.painter().galley(pos2(n.right(), at.y), songs, p.text_weak);
+            }
         }
         (raised, cover)
     }
@@ -600,7 +630,8 @@ impl CodaApp {
     /// Hovered, playing, or with its record sliding back in, it says what it painted, for [`OnTop`].
     pub(super) fn paint_sleeve(&mut self, ui: &Ui, cover: Rect, s: &Sleeve, playing: bool, hovered: bool, rest: f32) -> Option<Raised> {
         let p = self.palette;
-        let id = Id::new(("vn", &s.source, cover.width() as i32));
+        // By size in steps of 8, so a sidebar being dragged wider doesn't start its sleeves over.
+        let id = Id::new(("vn", &s.source, (cover.width() / 8.0).round() as i32));
         // Hovered, the sleeve lifts toward the user: a little bigger, its shadow longer (not with fades
         // only: it would jump).
         let rise = motion::toward(ui.ctx(), id.with("lift"), hovered && motion::moves(), motion::TAB);
@@ -656,7 +687,7 @@ mod tests {
     use egui::epaint::ClippedShape;
     use egui::{Color32, CornerRadius, Pos2, Rect, Shape, Ui, pos2, vec2};
 
-    use super::{Lift, OnTop, Raised, lifted, nearest_slot, reorder};
+    use super::{Lift, OnTop, Raised, SIDEBAR_CELL, grid_cells, lifted, nearest_slot, reorder, sleeve_side};
     use crate::ui::fin;
     use crate::ui::kit::headless::drawn;
 
@@ -770,5 +801,18 @@ mod tests {
         assert_eq!(nearest_slot(&slots, pos2(160.0, 50.0)), 1);
         assert_eq!(nearest_slot(&slots, pos2(-50.0, 50.0)), 0);
         assert_eq!(nearest_slot(&slots, pos2(400.0, 50.0)), 2);
+    }
+
+    #[test]
+    fn sleeves_fit_more_across_a_wider_sidebar() {
+        let across = |w: f32| grid_cells(w, SIDEBAR_CELL).0;
+        assert_eq!((across(240.0), across(299.0), across(300.0), across(420.0)), (3, 4, 4, 5));
+        // The 300 sidebar's cells: 4 of 68, the sleeve 46 with its record still in the cell.
+        let (_, w, h) = grid_cells(300.0, SIDEBAR_CELL);
+        assert!((w - 68.5).abs() < 0.01 && h == 46.0 + 52.0);
+        assert!(7.0 + 46.0 * 1.2 < w);
+        // The narrow Library page keeps its cells of about 112, and a 92 cell its 62 sleeve.
+        assert_eq!(grid_cells(760.0, 112.0).0, 6);
+        assert_eq!((sleeve_side(92.0), sleeve_side(200.0)), (62.0, 96.0));
     }
 }

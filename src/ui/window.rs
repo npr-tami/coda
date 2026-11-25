@@ -222,6 +222,42 @@ pub fn placement(hwnd: isize) -> Option<(ScreenRect, bool)> {
 
 /// Puts a still hidden window at its remembered normal place, if that is on a connected screen
 /// (it stays hidden). Returns whether it did.
+/// Un-minimizes the window if Windows has it minimized. The hidden start minimizes it natively
+/// (`main.rs`), behind winit's back, so winit's own `Minimized(false)` does nothing then and the
+/// window would show as Windows' tiny minimized strip. True if it was minimized.
+pub fn restore_if_minimized(hwnd: isize) -> bool {
+    #[cfg(windows)]
+    {
+        win32::restore_if_minimized(hwnd)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = hwnd;
+        false
+    }
+}
+
+/// Whether Windows has the window minimized (also when winit doesn't know it, see
+/// [`restore_if_minimized`]).
+pub fn is_minimized(hwnd: isize) -> bool {
+    #[cfg(windows)]
+    {
+        win32::is_minimized(hwnd)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = hwnd;
+        false
+    }
+}
+
+/// A place worth remembering for the full window: at least its smallest size (`min`, screen
+/// pixels) and not at Windows' parking spot for minimized windows (-32000).
+pub fn plausible_place(rect: [i32; 4], min: [i32; 2]) -> bool {
+    let [left, top, right, bottom] = rect;
+    left > -30_000 && top > -30_000 && right - left >= min[0] && bottom - top >= min[1]
+}
+
 pub fn restore_placement(hwnd: isize, normal: ScreenRect) -> bool {
     #[cfg(windows)]
     {
@@ -382,6 +418,8 @@ mod win32 {
         fn GetClientRect(hwnd: Hwnd, rect: *mut Rect) -> i32;
         fn GetDpiForWindow(hwnd: Hwnd) -> u32;
         fn PostMessageW(hwnd: Hwnd, msg: u32, wparam: usize, lparam: isize) -> i32;
+        fn IsIconic(hwnd: Hwnd) -> i32;
+        fn ShowWindow(hwnd: Hwnd, cmd: i32) -> i32;
     }
 
     #[link(name = "dwmapi")]
@@ -678,6 +716,23 @@ mod win32 {
         screen_rect(p.normal_position).map(|r| (r, maximized))
     }
 
+    pub fn is_minimized(hwnd: isize) -> bool {
+        // SAFETY: plain Win32 call; tolerates a stale handle.
+        unsafe { IsIconic(hwnd as Hwnd) != 0 }
+    }
+
+    pub fn restore_if_minimized(hwnd: isize) -> bool {
+        const SW_RESTORE: i32 = 9;
+        // SAFETY: plain Win32 calls; both tolerate a stale handle.
+        unsafe {
+            if IsIconic(hwnd as Hwnd) == 0 {
+                return false;
+            }
+            ShowWindow(hwnd as Hwnd, SW_RESTORE);
+        }
+        true
+    }
+
     pub fn restore_placement(hwnd: isize, normal: ScreenRect) -> bool {
         let rect = Rect { left: normal.left, top: normal.top, right: normal.right, bottom: normal.bottom };
         // SAFETY: plain Win32 calls with valid structs; a screen that is gone gives null.
@@ -698,6 +753,15 @@ mod win32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_minimized_or_tiny_place_is_not_remembered() {
+        let min = [400, 480];
+        assert!(plausible_place([1315, 356, 2962, 1300], min));
+        assert!(plausible_place([-1000, 100, 0, 1000], min), "a screen left of the main one");
+        assert!(!plausible_place([-32000, -32000, -31840, -31972], min), "Windows' minimized spot");
+        assert!(!plausible_place([100, 100, 260, 128], min), "the minimized strip's size");
+    }
 
     #[test]
     fn the_views_window_keeps_its_shape_from_any_corner() {

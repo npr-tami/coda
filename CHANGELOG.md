@@ -2,6 +2,25 @@
 
 The newest version is at the top.
 
+## 0.1.5
+
+This is the last public release of Coda. The repository will be archived after it: it stays readable, but gets no more updates.
+
+- **New look**: the sidebar, the page and the side panel are rounded cards on a plain dark base, with the wallpaper softer inside them. Tabs are chips, search and buttons are rounded, and headings are no longer in capitals. In the light theme the title bar and Settings follow the theme too.
+- **Sort a list's songs** by title, artist, album, date added or length, or in reverse. Each list remembers its sort, and Play in order plays them as shown.
+- **Up next**: drag songs to new places. The whole queue shows.
+- **Drag songs to new places in your own playlists**. If Spotify refuses the move, the song goes back and a note says so.
+- **Drag songs onto playlists** from the player bar, Up next, search, Home and the sidebar.
+- **Copy link** for playlists, albums and artists, and **paste a Spotify link** into search to open it.
+- **Add to library** on the page of a playlist that isn't in your library.
+- **Crop** a picture before it becomes a playlist's cover.
+- **Discord status settings**: your own top and bottom lines, what the member list shows, keep the status while paused, progress bar, album cover or Coda's icon, an optional "Open on Spotify" button, and **Hide from Discord** in the player bar's menu and the tray.
+- When the audio device drops out, Coda waits up to 8 seconds for it to come back before pausing.
+- Songs Spotify won't stream are skipped quietly instead of pausing, and a song is greyed out only when Spotify says it doesn't exist.
+- Start with Windows opens the full window, not a minimized one.
+- Long notes wrap instead of being cut off.
+- New listen-along playlists are named "Coda · listen along". Updates are looked for only under the repository's current name.
+
 ## 0.1.4 · 20/11/2026
 
 - A playlist opened from search (or from someone's profile) shows its name, owner and cover, not just "Playlist"

@@ -52,11 +52,11 @@ pub fn button_enabled(ui: &mut Ui, p: &Palette, label: &str, kind: Kind, enabled
         }
         return if enabled { resp.on_hover_cursor(CursorIcon::PointingHand) } else { resp };
     }
-    // The Final design's `.b`: 28 tall, 14 either side, 11 px semibold capitals spaced .05em; the
+    // The Final design's `.b`: 28 tall, 14 either side, 12 px semibold words as written; the
     // primary one in the accent. Greyed: the plain grey with dim text.
     let primary = kind == Kind::Primary;
     let color = if !enabled { p.text_faint } else if primary { p.on_accent } else { p.text };
-    let galley = fin::spaced(ui, &label.to_uppercase(), bold(11.0), Color32::PLACEHOLDER, 0.55);
+    let galley = fin::button_label(ui, label);
     let sense = if enabled { Sense::click() } else { Sense::hover() };
     let (rect, resp) = ui.allocate_exact_size(vec2(galley.size().x + 28.0, BUTTON_HEIGHT), sense);
     if ui.is_rect_visible(rect) {
@@ -72,7 +72,7 @@ pub fn button_enabled(ui: &mut Ui, p: &Palette, label: &str, kind: Kind, enabled
         let color = motion::color(ui.ctx(), resp.id.with("text"), color, motion::HOVER);
         let scale = motion::press(ui.ctx(), resp.id, enabled && resp.is_pointer_button_down_on());
         motion::scaled(ui, rect.center(), scale, || {
-            ui.painter().rect_filled(rect, CornerRadius::same(RADIUS), fill);
+            ui.painter().rect_filled(rect, CornerRadius::same((BUTTON_HEIGHT / 2.0) as u8), fill);
             ui.painter().galley(rect.center() - galley.size() / 2.0, galley, color);
         });
     }
@@ -113,18 +113,18 @@ pub fn line_slider(ui: &mut Ui, p: &Palette, value: &mut f32, range: RangeInclus
     resp
 }
 
-/// A card for settings rows: panel fill, 1-wide frame. An optional heading sits above it.
+/// A card for settings rows (Islands): a raised fill, round 12, no frame line. An optional heading
+/// (12 px semibold, as written) sits above it.
 pub fn card<R>(ui: &mut Ui, p: &Palette, heading: Option<&str>, add: impl FnOnce(&mut Ui) -> R) -> R {
     if let Some(h) = heading {
         ui.add_space(4.0);
-        let g = fin::spaced(ui, &h.to_uppercase(), bold(10.5), p.text_weak, 0.95);
+        let g = fin::spaced(ui, h, bold(12.0), p.text, 0.0);
         let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), g.size().y + 10.0), Sense::hover());
-        ui.painter().galley(pos2(rect.left() + 2.0, rect.top()), g, p.text_weak);
+        ui.painter().galley(pos2(rect.left() + 4.0, rect.top()), g, p.text);
     }
     let r = Frame::new()
-        .fill(p.sidebar_bg)
-        .stroke(Stroke::new(1.0, p.border))
-        .corner_radius(CornerRadius::same(8))
+        .fill(card_bg(p))
+        .corner_radius(CornerRadius::same(CARD_RADIUS))
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.spacing_mut().item_spacing.y = 0.0;
@@ -148,12 +148,20 @@ pub fn card_body<R>(ui: &mut Ui, p: &Palette, add: impl FnOnce(&mut Ui) -> R) ->
         .inner
 }
 
+/// A settings card's corners.
+pub const CARD_RADIUS: u8 = 12;
+
+/// A settings card's fill: a step up from the page (Islands' raised surface).
+pub fn card_bg(p: &Palette) -> Color32 {
+    p.raised_bg
+}
+
+/// Between a card's rows: a faint line, kept in from the card's sides.
 fn separator_unless_first(ui: &mut Ui, p: &Palette) {
     let top = ui.cursor().top();
     if top > ui.min_rect().top() + 0.5 {
-        let x = ui.max_rect().x_range();
-        let _ = p;
-        ui.painter().hline(x, top, Stroke::new(1.0, p.border));
+        let r = ui.max_rect();
+        ui.painter().hline((r.left() + 16.0)..=(r.right() - 16.0), top, Stroke::new(1.0, p.border.gamma_multiply(0.7)));
     }
 }
 

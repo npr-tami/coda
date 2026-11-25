@@ -77,6 +77,23 @@ pub struct PlaylistSummary {
     pub owner_id: String,
 }
 
+/// A playlist's header as Spotify has it now (`summary`: `None` when it couldn't be read), and how
+/// many people saved it (`likes`: `None` when Spotify didn't say, as for a private one).
+#[derive(Debug, Clone, PartialEq)]
+pub struct PlaylistDetails {
+    pub uri: String,
+    pub summary: Option<PlaylistSummary>,
+    pub likes: Option<u32>,
+}
+
+/// One of the user's listen-along link playlists: the link's id and who it is for (`None`: no
+/// link here uses it, as one left over from another PC or an older Coda).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LinkPlaylist {
+    pub uri: String,
+    pub link: Option<(u32, String)>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Source {
     Playlist(String),
@@ -513,6 +530,9 @@ pub enum Command {
     Lyrics(String),
     /// Fetch a song's Canvas, its looping video (Event::Canvas answers).
     Canvas(String),
+    /// A song's details (from memory, else looked up as a list's songs are), for a pasted song
+    /// link: Event::TrackFound answers.
+    FindTrack(String),
     /// Which of the user's playlists hold every one of these songs, from the lists Coda has (no
     /// network): the Add to playlist menu marks them Added.
     HeldBy(Vec<String>),
@@ -539,6 +559,9 @@ pub enum Command {
     Follow { uri: String, follow: bool, generation: u64 },
     /// Take the queued song at this place out (`None`: all of them).
     Unqueue(Option<usize>),
+    /// Move the song at place `from` of Up next (the queued songs, then the list's) to place `to`:
+    /// the play order itself changes (and is saved).
+    MoveQueued { from: usize, to: usize },
     /// Log in with cached credentials, or open the browser if `interactive`.
     Login { interactive: bool },
     Logout,
@@ -548,6 +571,9 @@ pub enum Command {
     /// Start playing a source. `start_index` is an index into the source's track list.
     /// With `shuffle`, a new random order is generated (the start track, if given, plays first).
     PlaySource { source: Source, start_index: Option<usize>, shuffle: bool },
+    /// Play a list unshuffled in `order` (places in its songs: the order a sorted page shows), from
+    /// `start_index` (a place in its songs) or the first of `order`.
+    PlayInOrder { source: Source, order: Vec<usize>, start_index: Option<usize> },
     /// Start a list over: forget which of its songs were heard this round, then play it in a fresh
     /// random order.
     NewRound { source: Source },
@@ -609,6 +635,10 @@ pub enum Command {
     AddToPlaylist { playlist_uri: String, uris: Vec<String>, again: Vec<String>, question: Option<AlreadyIn> },
     /// Remove songs (every copy of each) from one of the user's playlists.
     RemoveFromPlaylist { playlist_uri: String, uris: Vec<String> },
+    /// Move the song at place `from` of one of the user's playlists to place `to`; `before` is the
+    /// playlist as shown (the UI shows the move at once). If it fails, Event::SourceLoaded puts
+    /// `before` back, with an Event::Error.
+    MovePlaylistSong { playlist_uri: String, before: Arc<Vec<TrackInfo>>, from: usize, to: usize },
     /// Read one of the user's playlists as Spotify has it now, to find the songs in it more than
     /// once (Event::Duplicates answers).
     FindDuplicates(String),
@@ -620,6 +650,15 @@ pub enum Command {
     CreatePlaylist { name: String },
     /// Remove a playlist from the library (unfollow; for the owner this is Spotify's delete).
     RemovePlaylist { uri: String },
+    /// Add someone else's playlist to the library (follow it; Event::Status and a new library
+    /// answer).
+    AddPlaylist { uri: String },
+    /// A playlist's name, owner and likes as Spotify has them (Event::PlaylistDetails answers), for
+    /// its page: also one outside the library (found by a search) or a listen-along link's.
+    PlaylistDetails(String),
+    /// Delete one of the user's listen-along link playlists: its link goes too (it stops working
+    /// and leaves the Friends tab), or, for one no link here uses, just the playlist.
+    DeleteLinkPlaylist(String),
     /// Listen along with someone (`name` shows while following).
     ListenAlong { how: ListenHow, name: String },
     /// Stop listening along: the user's own music comes back, paused.
@@ -763,6 +802,8 @@ pub enum Event {
     /// A song's Canvas: its video, downloaded (`video`), or a picture to load (`picture`); neither
     /// when it has none or it couldn't be had.
     Canvas { uri: String, video: Option<std::path::PathBuf>, picture: Option<String> },
+    /// A song asked for with Command::FindTrack.
+    TrackFound(Box<TrackInfo>),
     /// The answer to [`Command::HeldBy`]: the playlists (uris) holding every one of `uris`.
     HeldBy { uris: Vec<String>, playlists: Vec<String> },
     /// Transient status line text.
@@ -810,6 +851,11 @@ pub enum Event {
     SourceInfo(SourceInfo),
     /// A playlist was removed from the library.
     PlaylistRemoved { uri: String },
+    /// The answer to [`Command::PlaylistDetails`].
+    PlaylistDetails(PlaylistDetails),
+    /// The user's own listen-along link playlists (every list leaves them out), so their pages can
+    /// say what they are and delete them.
+    LinkPlaylists(Arc<Vec<LinkPlaylist>>),
     /// Songs asked to go into a playlist that has some of them already: nothing was added yet.
     /// The questions are asked one at a time.
     AlreadyInPlaylist(AlreadyIn),

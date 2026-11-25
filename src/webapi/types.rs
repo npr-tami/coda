@@ -65,8 +65,6 @@ pub(super) struct ApiTrack {
     #[serde(default)]
     pub duration_ms: Option<u64>,
     #[serde(default)]
-    pub is_playable: Option<bool>,
-    #[serde(default)]
     pub is_local: Option<bool>,
     #[serde(default, rename = "type")]
     pub kind: Option<String>,
@@ -162,7 +160,8 @@ pub(super) fn track_info(track: ApiTrack) -> Option<TrackInfo> {
         cover_large: pick_image(&album.images, 300),
         album: album.name,
         duration_ms: track.duration_ms.unwrap_or(0).min(u64::from(u32::MAX)) as u32,
-        playable: streamable && !is_local && track.is_playable.unwrap_or(true),
+        // Spotify's `is_playable` is about the region and often temporary: not greyed out for it.
+        playable: streamable && !is_local,
         is_local,
         uri,
         added_at: 0,
@@ -306,7 +305,7 @@ mod tests {
         assert!(first.playable && !first.is_local);
         let locked = &tracks[1];
         assert_eq!(locked.uri, "spotify:track:1301WleyT98MSxVHPZCA6M");
-        assert!(!locked.playable);
+        assert!(locked.playable, "a region lock doesn't grey a song out");
         assert!(locked.artists.is_empty());
         assert_eq!(locked.cover_small, None);
     }

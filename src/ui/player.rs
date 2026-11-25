@@ -111,13 +111,13 @@ pub(super) fn controls_center(r: Rect, l: &Layout) -> f32 {
 /// The playing song's name in the player bar at `r`: clicked, or dragged onto a playlist to add the
 /// song `uri` there, as from a list (none for a local file, which can't go into one). Only the name
 /// drags, and only once the mouse moves: a click never shows the drag.
-fn bar_title(ui: &Ui, r: Rect, uri: Option<&str>) -> egui::Response {
+fn bar_title(ui: &Ui, r: Rect, song: Option<(&str, &str)>) -> egui::Response {
     let resp = ui.interact(r, Id::new("bar-title"), Sense::click_and_drag());
     // Only the left button drags songs, as in the lists.
-    if let Some(uri) = uri
+    if let Some((uri, name)) = song
         && resp.drag_started_by(egui::PointerButton::Primary)
     {
-        resp.dnd_set_drag_payload(super::dnd::SongsDrag { uris: vec![uri.to_owned()] });
+        resp.dnd_set_drag_payload(super::dnd::SongsDrag::many(vec![uri.to_owned()], Some(name)));
     }
     // The hand while it can be clicked; while dragged, the drag's own cursor.
     if resp.dragged() { resp } else { resp.on_hover_cursor(egui::CursorIcon::PointingHand) }
@@ -130,7 +130,6 @@ impl CodaApp {
     pub(super) fn player_bar(&mut self, ui: &mut Ui, l: &Layout) {
         let p = self.palette;
         let r = ui.max_rect();
-        ui.painter().hline(r.x_range(), r.top() + 0.5, egui::Stroke::new(1.0, p.border));
         let medium = l.mode != Mode::Wide;
         let (np_w, rt_w) = if medium { (240.0, 210.0) } else { (290.0, 290.0) };
         let np = Rect::from_min_size(pos2(r.left() + 14.0, r.center().y - 30.0), vec2(np_w, 60.0));
@@ -184,10 +183,7 @@ impl CodaApp {
         let h = title.size().y + 2.0 + artists.size().y;
         let y = np.center().y - h / 2.0;
         let title_rect = Rect::from_min_size(pos2(text_left, y), title.size());
-        let title_resp = bar_title(ui, title_rect, (!track.is_local).then_some(track.uri.as_str()));
-        if title_resp.dragged() {
-            self.paint_songs_drag(ui, std::slice::from_ref(&track));
-        }
+        let title_resp = bar_title(ui, title_rect, (!track.is_local).then_some((track.uri.as_str(), track.name.as_str())));
         let title_color = p.text_strong;
         let th = title.size().y;
         ui.painter().galley(pos2(text_left, y), title, title_color);
@@ -297,7 +293,7 @@ impl CodaApp {
         }
 
         // The seek row.
-        let sk_w = mid.width().min(520.0);
+        let sk_w = mid.width().min(680.0);
         let sk_y = top + 36.0 + 5.0 + time_h / 2.0;
         let left = mid.center().x - sk_w / 2.0;
         self.seek_strip(ui, left, left + sk_w, sk_y, Id::new("bar-seek"));
@@ -491,6 +487,8 @@ impl CodaApp {
         let has_track = self.playback.track.is_some();
         let mut choice: Option<Option<SleepTimer>> = None;
         let (mut mini, mut stage) = (false, false);
+        let (discord_on, mut hide_discord) = (self.prefs.discord_status, false);
+        let hidden = self.prefs.discord_hidden;
         Popup::menu(resp)
             .align(RectAlign::TOP_END)
             .align_alternatives(&[RectAlign::TOP_START, RectAlign::BOTTOM_END])
@@ -527,10 +525,20 @@ impl CodaApp {
                         ui.close();
                     }
                 }
+                if discord_on {
+                    fin::menu_sep(ui);
+                    if fin::menu_item(ui, None, "Hide from Discord", None, hidden, true).clicked() {
+                        hide_discord = true;
+                        ui.close();
+                    }
+                }
             });
         if mini {
             let ctx = ui.ctx().clone();
             self.toggle_mini(&ctx);
+        }
+        if hide_discord {
+            self.toggle_discord_hidden();
         }
         if stage {
             let ctx = ui.ctx().clone();
@@ -570,7 +578,7 @@ impl CodaApp {
     }
 
     /// Opens `source` and scrolls to the track `uri` in it.
-    fn show_track_in(&mut self, source: crate::model::Source, uri: String) {
+    pub(super) fn show_track_in(&mut self, source: crate::model::Source, uri: String) {
         self.middle_tab = super::MiddleTab::Songs;
         let showing = self.view.as_ref().is_some_and(|v| v.source == source && v.tracks.is_some());
         if showing {
@@ -622,7 +630,7 @@ mod tests {
     const TITLE: Rect = Rect { min: egui::Pos2 { x: 80.0, y: 352.0 }, max: egui::Pos2 { x: 180.0, y: 368.0 } };
 
     /// One pass of the name with `events`: whether it was clicked, and whether a song is dragged.
-    fn title_pass(ctx: &egui::Context, events: Vec<egui::Event>, uri: Option<&str>) -> (bool, bool) {
+    fn title_pass(ctx: &egui::Context, events: Vec<egui::Event>, uri: Option<(&str, &str)>) -> (bool, bool) {
         let mut clicked = false;
         pass(ctx, events, |ui| clicked = bar_title(ui, TITLE, uri).clicked());
         (clicked, egui::DragAndDrop::has_payload_of_type::<crate::ui::dnd::SongsDrag>(ctx))
@@ -631,7 +639,7 @@ mod tests {
     #[test]
     fn a_click_on_the_playing_songs_name_drags_nothing_and_moving_it_does() {
         let ctx = egui::Context::default();
-        let song = Some("spotify:track:a");
+        let song = Some(("spotify:track:a", "A song"));
         let (at, away) = (TITLE.center(), TITLE.center() + vec2(40.0, -60.0));
         // Pressed and held still: nothing is dragged (no chip, no drag cursor).
         title_pass(&ctx, move_to(at), song);

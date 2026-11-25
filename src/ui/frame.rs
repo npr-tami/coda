@@ -1,10 +1,13 @@
 //! The design's frame ("sign", "body", "pb" and "st"): the chrome
-//! title bar, the sidebar that folds 300 → 56 strip → hidden, the side panel (340 wide, 280 at medium
-//! widths), the player bar, and the window's own edges (Coda draws its own title bar).
+//! title bar, the sidebar (300 by default, 240-420 by dragging its edge, or the 56 strip), the side
+//! panel (340 by default, 260-480 by dragging its edge), the player bar, and the window's own edges
+//! (Coda draws its own title bar).
 //!
-//! Two widths fold everything: 1200 and 760. From 1200 the sidebar is 300 (Ctrl+B folds it to the strip) and
-//! the side panel 340. From 760 to 1199 the sidebar is the 56 strip (Ctrl+B opens the 300 over the page) and
-//! the side panel 280 when open. Under 760 the sidebar opens over the page and the panel stays closed.
+//! No width folds the layout on its own above 760: each side keeps the width the user dragged it to,
+//! and when the window gets too small for it and a 480 page, the side panel narrows first, then the
+//! sidebar, then the side panel steps aside, and last the sidebar becomes the strip (see [`layout`]).
+//! Shrinking the window never changes the widths kept in the settings, so they come back with the room.
+//! Under 760 the sidebar opens over the page and the panel stays closed.
 
 use egui::{
     Color32, CornerRadius, CursorIcon, Id, Order, Rect, Sense, Stroke, TextureHandle, Ui,
@@ -17,17 +20,39 @@ use super::svgicon;
 use super::{MiddleTab, CodaApp};
 use crate::model::Source;
 
-/// From this width up: the 300 sidebar and the 340 side panel.
+/// From this width up the player bar and title bar take their roomier sizes (looks only: what the
+/// sidebar and panel get comes from [`layout`]).
 pub const WIDE: f32 = 1200.0;
 /// Under this width: no sidebar or side panel beside the page.
 pub const NARROW: f32 = 760.0;
-/// The narrowest page beside the full sidebar below the wide layout.
-pub const MEDIUM_PAGE_MIN: f32 = 560.0;
 pub const SIGN_H: f32 = 52.0;
-pub const SIDE_W: f32 = 300.0;
 pub const STRIP_W: f32 = 56.0;
+/// The gap around and between the cards (the sidebar, the page, the side panel), and their corners.
+pub const CARD_GAP: f32 = 8.0;
+pub const CARD_R: u8 = 12;
+/// How much of a whole-window wallpaper shows inside the cards: half the strength set in Settings,
+/// so words stay easy to read over it.
+pub const CARD_WALL: f32 = 0.5;
+/// Islands: the base (the gaps between the cards, the title bar, the player bar) is plain. True puts
+/// a whole-window wallpaper there too, at full strength (the "Cards + wallpaper" look).
+pub const WALL_IN_GAPS: bool = false;
+/// How far down the page card's lift fades out (see `Palette::page_lift`).
+const PAGE_LIFT_H: f32 = 260.0;
+/// The sidebar's width: by default, and the narrowest and widest it can be dragged to.
+pub const SIDE_W: f32 = 300.0;
+pub const SIDE_MIN: f32 = 240.0;
+pub const SIDE_MAX: f32 = 420.0;
+/// The side panel's width: by default, and the narrowest and widest it can be dragged to.
 pub const PANEL_W: f32 = 340.0;
-pub const PANEL_W_MED: f32 = 280.0;
+pub const PANEL_MIN: f32 = 260.0;
+pub const PANEL_MAX: f32 = 480.0;
+/// The narrowest page the sidebar and side panel leave beside them before giving way.
+pub const PAGE_MIN: f32 = 480.0;
+/// Dragged this far under its narrowest, the sidebar folds to the strip and the side panel closes;
+/// the strip dragged out past this opens the sidebar again.
+pub const SIDE_SNAP: f32 = 180.0;
+pub const PANEL_SNAP: f32 = 180.0;
+pub const STRIP_SNAP: f32 = 112.0;
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Mode {
     Wide,
@@ -62,45 +87,116 @@ pub struct Layout {
     pub panel_w: f32,
     /// The search box's width in the title bar.
     pub search_w: f32,
+    /// The sidebar is the strip only because the window has no room for it (Ctrl+B then opens it
+    /// over the page).
+    pub side_squeezed: bool,
+    /// The side panel is open in the settings but the window has no room for it.
+    pub panel_squeezed: bool,
 }
 
-/// The sidebar and side panel at width `w`: `folded` (the wide sidebar is the strip), `panel_wide` and
-/// `panel_medium` (the side panel is open at those widths).
-pub fn layout(w: f32, folded: bool, panel_wide: bool, panel_medium: bool) -> Layout {
+/// What the user asked for: the sidebar's and side panel's widths (as dragged, or the defaults),
+/// whether the sidebar is folded to the strip, whether the side panel is open, and whether, short of
+/// room, the panel should stay and the sidebar fold (Ctrl+P on a squeezed-out panel).
+#[derive(Clone, Copy, Debug)]
+pub struct Want {
+    pub side: f32,
+    pub panel: f32,
+    pub folded: bool,
+    pub panel_open: bool,
+    pub keep_panel: bool,
+}
+
+impl Default for Want {
+    fn default() -> Self {
+        Self { side: SIDE_W, panel: PANEL_W, folded: false, panel_open: true, keep_panel: false }
+    }
+}
+
+/// A dragged or saved width kept within `min`..=`max` (nonsense gives `default`).
+pub fn clamp_width(w: Option<f32>, default: f32, min: f32, max: f32) -> f32 {
+    w.filter(|w| w.is_finite()).unwrap_or(default).clamp(min, max).round()
+}
+
+/// The sidebar and side panel in a window `w` wide. Each keeps the width wanted while the page keeps
+/// [`PAGE_MIN`]; short of room the panel narrows to [`PANEL_MIN`], then the sidebar to [`SIDE_MIN`],
+/// then the panel steps aside (the sidebar back to its width), and last the sidebar becomes the strip.
+/// With `keep_panel` the sidebar becomes the strip before the panel steps aside.
+pub fn layout(w: f32, want: Want) -> Layout {
     let mode = mode_of(w);
-    let (side, side_w, panel_w) = match mode {
-        Mode::Wide if folded => (Side::Strip, STRIP_W, if panel_wide { PANEL_W } else { 0.0 }),
-        Mode::Wide => (Side::Open, SIDE_W, if panel_wide { PANEL_W } else { 0.0 }),
-        Mode::Medium => {
-            let panel_w = if panel_medium { PANEL_W_MED } else { 0.0 };
-            // The full sidebar while the page keeps room enough (a large interface size makes the
-            // window count as narrower); else the strip.
-            if !folded && w - SIDE_W - panel_w >= MEDIUM_PAGE_MIN { (Side::Open, SIDE_W, panel_w) } else { (Side::Strip, STRIP_W, panel_w) }
-        }
-        Mode::Narrow => (Side::None, 0.0, 0.0),
-    };
     let search_w = match mode {
         Mode::Wide => (w - 560.0).clamp(200.0, 420.0),
         _ if w >= 900.0 => 280.0,
         _ if w >= 820.0 => 240.0,
         _ => 200.0,
     };
-    Layout { mode, w, side, side_w, panel_w, search_w }
+    let base = Layout { mode, w, side: Side::None, side_w: 0.0, panel_w: 0.0, search_w, side_squeezed: false, panel_squeezed: false };
+    if mode == Mode::Narrow {
+        return base;
+    }
+    let side_want = clamp_width(Some(want.side), SIDE_W, SIDE_MIN, SIDE_MAX);
+    let panel_want = clamp_width(Some(want.panel), PANEL_W, PANEL_MIN, PANEL_MAX);
+    let room = w - PAGE_MIN;
+    // The widths with the sidebar open (or the strip) and the panel open (or not), each narrowed as far
+    // as it may go: the panel first.
+    let fit = |side_open: bool, panel_open: bool| -> (f32, f32, bool) {
+        let mut side = if side_open { side_want } else { STRIP_W };
+        let mut panel = if panel_open { panel_want } else { 0.0 };
+        if side + panel > room && panel_open {
+            panel = (room - side).clamp(PANEL_MIN, panel);
+        }
+        if side + panel > room && side_open {
+            side = (room - panel).clamp(SIDE_MIN, side);
+        }
+        (side, panel, side + panel <= room + 0.01)
+    };
+    let side_open = !want.folded;
+    let mut choices = vec![(side_open, want.panel_open)];
+    if want.keep_panel {
+        choices.extend([(false, want.panel_open), (side_open, false)]);
+    } else {
+        choices.extend([(side_open, false), (false, want.panel_open)]);
+    }
+    choices.push((false, false));
+    let (open, panel_on, side_w, panel_w) = choices
+        .iter()
+        .find_map(|&(s, p)| {
+            let (sw, pw, fits) = fit(s, p);
+            fits.then_some((s, p, sw, pw))
+        })
+        // Not even the strip and a page fit: the page gets what is left.
+        .unwrap_or_else(|| (false, false, STRIP_W, 0.0));
+    Layout {
+        side: if open { Side::Open } else { Side::Strip },
+        side_w: side_w.round(),
+        panel_w: panel_w.round(),
+        side_squeezed: side_open && !open,
+        panel_squeezed: want.panel_open && !panel_on,
+        ..base
+    }
 }
 
 /// The frame's state for this run.
 #[derive(Default)]
 pub struct FrameState {
+    /// Playlists that take dragged songs were drawn this pass (the sidebar, its strip or its
+    /// overlay): when not, a drag shows the drop tray instead.
+    pub song_targets: bool,
     /// The 300 sidebar is open over the page (medium and narrow widths).
     pub side_over: bool,
     /// The side panel's tab.
     pub panel_tab: super::panel::Tab,
+    /// Ctrl+P brought back a side panel the window had no room for: the sidebar is the strip for it
+    /// (for this run only).
+    pub keep_panel: bool,
+    /// The sidebar's or side panel's edge being dragged.
+    pub sash: Option<Sash>,
     wordmark: Option<TextureHandle>,
     /// Passes drawn, and whether a self-shot has been asked for (see [`FrameState::self_shot`]).
     passes: u64,
     shot_asked: bool,
-    /// Passes drawn at the size a self-shot asked for.
+    /// Passes drawn at the size a self-shot asked for, since when.
     settled: u32,
+    settled_at: Option<std::time::Instant>,
     /// Words after the size in a self-shot request ("panel": the side panel open for the picture).
     shot_flags: Vec<String>,
     /// The window's size and maximised state before a self-shot changed them: put back after it.
@@ -124,6 +220,25 @@ pub struct FrameState {
     page_since: Option<std::time::Instant>,
 }
 
+/// The edge between the page and the sidebar, or the page and the side panel.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum Edge {
+    Side,
+    Panel,
+}
+
+/// An edge being dragged: the width its side had and where the mouse was when the drag started, and
+/// the width under the mouse now (kept within what the side may be).
+#[derive(Clone, Copy, Debug)]
+pub struct Sash {
+    pub edge: Edge,
+    start_w: f32,
+    start_x: f32,
+    pub live: f32,
+    /// Dragged past the snap: the sidebar folds to the strip, or the panel closes, on letting go.
+    pub snapped: bool,
+}
+
 /// Middle-click scrolling: where it started, when, and whether the button was held and moved
 /// (then letting go ends it).
 struct AutoScroll {
@@ -138,6 +253,8 @@ struct ShotRestore {
     source: Option<Source>,
     help: bool,
     settings: bool,
+    stage: bool,
+    lyrics_off: bool,
 }
 
 /// A test aid: while a file named `coda-shot.request` sits beside coda.exe, Coda saves what it
@@ -224,8 +341,12 @@ impl FrameState {
             ctx.request_repaint_after(std::time::Duration::from_millis(50));
             return;
         }
+        // Eight passes and 0.7 s at the size asked for, so fades (a theme asked for, hovers) end.
+        if self.settled == 0 {
+            self.settled_at = Some(std::time::Instant::now());
+        }
         self.settled += 1;
-        if self.settled < 8 {
+        if self.settled < 8 || self.settled_at.is_some_and(|at| at.elapsed() < std::time::Duration::from_millis(700)) {
             ctx.request_repaint_after(std::time::Duration::from_millis(50));
             return;
         }
@@ -247,7 +368,7 @@ const WORDMARK_SIZE: egui::Vec2 = egui::vec2(70.0, 16.25);
 /// window buttons: 46 wide (40 when `narrow`), the bar's full height, coloured for a `light` bar or a
 /// dark one. Returns where they start.
 pub(super) fn window_controls(ui: &Ui, r: Rect, narrow: bool, light: bool) -> f32 {
-    // The title bar is dark in both themes; the startup screen follows the theme.
+    // The bar follows the theme (`light`).
     let p = crate::ui::theme::palette(ui.ctx());
     let p = if light { p } else { p.on_dark() };
     // Made first, so everything on the bar gets its own clicks.
@@ -351,40 +472,71 @@ impl CodaApp {
 
     pub(super) fn frame_layout(&self, w: f32) -> Layout {
         let shot_panel = self.frame.shot_flags.iter().any(|f| f == "panel");
-        layout(w, self.prefs.sidebar_folded, self.prefs.show_rules_panel || shot_panel, self.prefs.panel_medium || shot_panel)
+        // While an edge is dragged, its side takes the width under the mouse.
+        let dragged = |edge: Edge| self.frame.sash.filter(|s| s.edge == edge).map(|s| s.live);
+        let want = Want {
+            side: dragged(Edge::Side).unwrap_or_else(|| clamp_width(self.prefs.library_width, SIDE_W, SIDE_MIN, SIDE_MAX)),
+            panel: dragged(Edge::Panel).unwrap_or_else(|| clamp_width(self.prefs.deck_width, PANEL_W, PANEL_MIN, PANEL_MAX)),
+            folded: self.prefs.sidebar_folded,
+            panel_open: self.prefs.show_rules_panel || shot_panel,
+            keep_panel: self.frame.keep_panel,
+        };
+        layout(w, want)
     }
 
-    /// Ctrl+B and the sidebar button: at wide widths the sidebar folds to the strip and back; below, the
-    /// 300 sidebar opens over the page and closes again.
+    /// Ctrl+B and the sidebar button: the sidebar folds to the strip and back. When it is the strip only
+    /// for want of room (or the window is narrow), the sidebar opens over the page and closes again; when
+    /// that was for the side panel (Ctrl+P), the sidebar comes back and the panel steps aside.
     pub(super) fn cycle_sidebar(&mut self, w: f32) {
         let l = self.frame_layout(w);
-        let roomy = l.mode == Mode::Medium && w - SIDE_W - l.panel_w >= MEDIUM_PAGE_MIN;
-        if mode_of(w) == Mode::Wide || roomy {
+        if l.mode != Mode::Narrow && l.side_squeezed && self.frame.keep_panel {
+            self.frame.keep_panel = false;
+            self.frame.side_over = false;
+        } else if l.mode == Mode::Narrow || l.side_squeezed {
+            self.frame.side_over = !self.frame.side_over;
+        } else {
             self.prefs.sidebar_folded = !self.prefs.sidebar_folded;
             self.frame.side_over = false;
             self.prefs_changed();
-        } else {
-            self.frame.side_over = !self.frame.side_over;
         }
     }
 
-    /// The 300 sidebar is open over the page in a window `w` wide (it is never over it when wide).
+    /// The sidebar is open over the page in a window `w` wide (never while it is open beside it).
     pub(super) fn sidebar_over_open(&self, w: f32) -> bool {
-        self.frame.side_over && mode_of(w) != Mode::Wide
+        self.frame.side_over && self.frame_layout(w).side != Side::Open
     }
 
-    /// Ctrl+P and the panel button: the side panel at this width opens or closes.
+    /// Ctrl+P and the panel button: the side panel opens or closes. Open but stepped aside for want of
+    /// room, it comes back and the sidebar folds to the strip for it instead.
     pub(super) fn toggle_side_panel(&mut self, w: f32) {
-        match mode_of(w) {
-            Mode::Wide => self.prefs.show_rules_panel = !self.prefs.show_rules_panel,
-            Mode::Medium => self.prefs.panel_medium = !self.prefs.panel_medium,
-            Mode::Narrow => {}
+        let l = self.frame_layout(w);
+        if l.mode == Mode::Narrow {
+            return;
         }
-        self.prefs_changed();
+        if l.panel_squeezed {
+            self.frame.keep_panel = true;
+        } else {
+            self.prefs.show_rules_panel = !self.prefs.show_rules_panel;
+            self.frame.keep_panel = false;
+            self.prefs_changed();
+        }
+    }
+
+    /// The side panel opens (Friends, Lyrics from a song's menu): stepped aside for want of room, it
+    /// comes back with the sidebar as the strip.
+    pub(super) fn open_side_panel(&mut self, w: f32) {
+        if !self.prefs.show_rules_panel {
+            self.prefs.show_rules_panel = true;
+            self.prefs_changed();
+        }
+        if self.frame_layout(w).panel_squeezed {
+            self.frame.keep_panel = true;
+        }
     }
 
     pub(super) fn main_ui(&mut self, ui: &mut Ui) {
         self.typing_at_start = ui.ctx().text_edit_focused();
+        self.frame.song_targets = false;
         self.track_place();
         let p = self.palette;
         let ctx = ui.ctx().clone();
@@ -405,7 +557,7 @@ impl CodaApp {
                     self.settings_query = q.replace('_', " ");
                 }
             }
-            ui.painter().rect_filled(ui.max_rect(), CornerRadius::ZERO, p.main_bg);
+            ui.painter().rect_filled(ui.max_rect(), CornerRadius::ZERO, p.settings_bg());
             self.settings_contents(ui);
             return;
         }
@@ -514,42 +666,69 @@ impl CodaApp {
         let bar = Rect::from_min_max(pos2(full.left(), full.bottom() - super::player::BAR_HEIGHT), full.max);
         let body = Rect::from_min_max(pos2(full.left(), sign.bottom()), pos2(full.right(), bar.top()));
 
-        region(ui, sign, "sign", None, |ui| self.sign_bar(ui, &l));
-        region(ui, bar, "player-bar", Some(p.bar_bg), |ui| {
-            self.wallpaper_behind_panel(ui);
-            self.player_bar(ui, &l);
-        });
-
-
-        let side = Rect::from_min_max(body.min, pos2(body.left() + l.side_w, body.bottom()));
-        let panel = Rect::from_min_max(pos2(body.right() - l.panel_w, body.top()), body.max);
-        let main = Rect::from_min_max(pos2(side.right(), body.top()), pos2(panel.left(), body.bottom()));
-        if l.side != Side::None {
-            region(ui, side, "sidebar", Some(p.sidebar_bg), |ui| {
+        // The window's base under the cards and the player bar (the title bar paints its own).
+        let base = p.base_bg();
+        region(ui, Rect::from_min_max(body.min, full.max), "base", Some(base), |ui| {
+            if WALL_IN_GAPS {
                 self.wallpaper_behind_panel(ui);
-                let r = ui.max_rect();
+            }
+        });
+        region(ui, sign, "sign", None, |ui| self.sign_bar(ui, &l));
+        region(ui, bar, "player-bar", None, |ui| self.player_bar(ui, &l));
+
+        // The sidebar, the page and the side panel are cards on the base, CARD_GAP apart and from the
+        // window's sides; their edges are dragged in the gaps between them.
+        let cards = Rect::from_min_max(pos2(body.left() + CARD_GAP, body.top()), pos2(body.right() - CARD_GAP, body.bottom()));
+        let side = Rect::from_min_max(cards.min, pos2(cards.left() + l.side_w, cards.bottom()));
+        let panel = Rect::from_min_max(pos2(cards.right() - l.panel_w, cards.top()), cards.max);
+        let left = if l.side != Side::None { side.right() + CARD_GAP } else { cards.left() };
+        let right = if l.panel_w > 0.0 { panel.left() - CARD_GAP } else { cards.right() };
+        let main = Rect::from_min_max(pos2(left, cards.top()), pos2(right.max(left), cards.bottom()));
+        if l.side != Side::None {
+            self.frame.song_targets = l.side == Side::Open;
+            region(ui, side, "sidebar", None, |ui| {
+                ui.painter().rect_filled(side, CornerRadius::same(CARD_R), p.sidebar_bg);
+                self.wallpaper_in_card(ui, false, CARD_WALL);
                 match l.side {
                     Side::Open => self.sidebar_full(ui),
                     _ => self.sidebar_strip(ui),
                 }
-                ui.painter().vline(r.right() - 0.5, r.y_range(), Stroke::new(1.0, p.border));
             });
+            self.round_card_corners(ui.painter(), side, f32::from(CARD_R), base);
         }
         if l.panel_w > 0.0 {
-            region(ui, panel, "side-panel", Some(p.sidebar_bg), |ui| {
-                self.wallpaper_behind_panel(ui);
-                let r = ui.max_rect();
+            region(ui, panel, "side-panel", None, |ui| {
+                ui.painter().rect_filled(panel, CornerRadius::same(CARD_R), p.sidebar_bg);
+                self.wallpaper_in_card(ui, false, CARD_WALL);
                 self.side_panel(ui, &l);
-                ui.painter().vline(r.left() + 0.5, r.y_range(), Stroke::new(1.0, p.border));
             });
+            self.round_card_corners(ui.painter(), panel, f32::from(CARD_R), base);
         }
         self.frame.page_rect = Some(main);
-        region(ui, main, "page", Some(p.main_bg), |ui| {
-            self.wallpaper_behind_songs(ui);
+        region(ui, main, "page", None, |ui| {
+            ui.painter().rect_filled(main, CornerRadius::same(CARD_R), p.main_bg);
+            let lift = Rect::from_min_size(main.min, vec2(main.width(), PAGE_LIFT_H.min(main.height())));
+            fin::vgradient(ui.painter(), lift, p.page_lift(), p.main_bg);
+            self.wallpaper_in_card(ui, true, CARD_WALL);
             self.page(ui, p.main_bg, |app, ui| app.center_view(ui));
         });
-        if l.mode != Mode::Wide && self.frame.side_over {
+        self.round_card_corners(ui.painter(), main, f32::from(CARD_R), base);
+        // The edges that drag the sidebar's and the side panel's widths (over the regions, so they win
+        // over what is beside them).
+        if l.side == Side::Open || (l.side == Side::Strip && !l.side_squeezed) {
+            self.sash(ui, Edge::Side, side.right() + CARD_GAP / 2.0, body, &l);
+        }
+        if l.panel_w > 0.0 {
+            self.sash(ui, Edge::Panel, panel.left() - CARD_GAP / 2.0, body, &l);
+        }
+        // A drag that ended where no edge saw it let go (its side gone from under it) ends here.
+        if self.frame.sash.is_some() && !ui.input(|i| i.pointer.any_down()) {
+            self.frame.sash = None;
+        }
+        if l.side != Side::Open && self.frame.side_over {
             self.sidebar_over(&ctx, Rect::from_min_max(pos2(body.left() + l.side_w, body.top()), body.max), l.side_w);
+        } else {
+            self.frame.side_over = false;
         }
         // Listening along: the pill sits above the controls, notes above it.
         let lift = if self.listening() { 38.0 } else { 0.0 };
@@ -558,6 +737,87 @@ impl CodaApp {
         self.song_menu_ui(&ctx);
         self.help_ui(&ctx);
         self.window_edges(&ctx);
+    }
+
+    /// The edge at `x` between the page and the sidebar (`Edge::Side`) or the side panel: dragged, its
+    /// side follows the mouse within what it may be and the page's room, and keeps that width after;
+    /// dragged far enough in, the sidebar folds to the strip or the panel closes (and the strip
+    /// dragged out opens the sidebar again). A double click puts the default width back. A line in
+    /// the accent shows while it is hovered or dragged.
+    fn sash(&mut self, ui: &mut Ui, edge: Edge, x: f32, body: Rect, l: &Layout) {
+        let p = self.palette;
+        // The gap between the cards, and a little over each (away from their scrollbars).
+        let rect = Rect::from_min_max(pos2(x - CARD_GAP / 2.0 - 1.0, body.top()), pos2(x + CARD_GAP / 2.0 + 1.0, body.bottom()));
+        let id = Id::new(("sash", edge));
+        let resp = ui.interact(rect, id, Sense::click_and_drag());
+        // Something else being dragged (a song, a pinned sleeve) passes over it untouched.
+        if ui.ctx().dragged_id().is_some_and(|d| d != id) {
+            return;
+        }
+        let strip = edge == Edge::Side && l.side == Side::Strip;
+        let (drawn, other, min, max, snap) = match edge {
+            Edge::Side => (l.side_w, l.panel_w, SIDE_MIN, SIDE_MAX, SIDE_SNAP),
+            Edge::Panel => (l.panel_w, l.side_w, PANEL_MIN, PANEL_MAX, PANEL_SNAP),
+        };
+        let sign = if edge == Edge::Side { 1.0 } else { -1.0 };
+        if resp.drag_started()
+            && let Some(at) = resp.interact_pointer_pos()
+        {
+            self.frame.sash = Some(Sash { edge, start_w: drawn, start_x: at.x, live: drawn, snapped: false });
+        }
+        let pointer = ui.input(|i| i.pointer.latest_pos());
+        if let Some(s) = self.frame.sash.as_mut().filter(|s| s.edge == edge)
+            && let Some(at) = pointer
+        {
+            let wanted = s.start_w + sign * (at.x - s.start_x);
+            if strip {
+                // The strip opens the sidebar once dragged out far enough.
+                s.snapped = wanted > STRIP_SNAP;
+                s.live = clamp_width(self.prefs.library_width, SIDE_W, SIDE_MIN, SIDE_MAX);
+            } else {
+                // As wide as it may be, while the other side keeps its width and the page its room.
+                let most = (l.w - PAGE_MIN - other).min(max).max(min);
+                s.snapped = wanted < snap;
+                s.live = wanted.clamp(min, most).round();
+            }
+        }
+        if resp.drag_stopped()
+            && let Some(s) = self.frame.sash.take()
+        {
+            match (edge, strip, s.snapped) {
+                (Edge::Side, true, true) => self.prefs.sidebar_folded = false,
+                (Edge::Side, true, false) => {}
+                (Edge::Side, false, true) => self.prefs.sidebar_folded = true,
+                (Edge::Panel, _, true) => {
+                    self.prefs.show_rules_panel = false;
+                    self.frame.keep_panel = false;
+                }
+                (Edge::Side, false, false) => self.prefs.library_width = Some(s.live),
+                (Edge::Panel, _, false) => self.prefs.deck_width = Some(s.live),
+            }
+            self.prefs_changed();
+        }
+        if resp.double_clicked() {
+            match edge {
+                Edge::Side => {
+                    self.prefs.library_width = None;
+                    self.prefs.sidebar_folded = false;
+                }
+                Edge::Panel => self.prefs.deck_width = None,
+            }
+            self.prefs_changed();
+        }
+        let dragging = self.frame.sash.is_some_and(|s| s.edge == edge);
+        if resp.hovered() || dragging {
+            ui.ctx().set_cursor_icon(CursorIcon::ResizeColumn);
+            // Past the snap, the line dims: letting go folds or closes.
+            let snapped = self.frame.sash.is_some_and(|s| s.edge == edge && s.snapped && !strip);
+            let color = if snapped { p.text_weak } else { p.accent_ink };
+            ui.painter().with_clip_rect(body).vline(x, body.y_range(), Stroke::new(2.0, color));
+        }
+        if dragging {
+            ui.ctx().request_repaint();
+        }
     }
 
     /// The 56 strip (`.strip`): Home, Albums, Artists, a line, then every playlist as a small sleeve.
@@ -618,6 +878,13 @@ impl CodaApp {
             let cover = Rect::from_min_size(pos2(cell.left() + 3.0, cell.center().y - 17.0), vec2(34.0, 34.0));
             let sleeve = super::sidebar::Sleeve { source: source.clone(), name: name.clone(), image: image.clone(), count: None, uri: None, editable: false };
             self.paint_sleeve(ui, cover, &sleeve, playing.as_ref() == Some(&source), resp.hovered(), 0.2);
+            // As in the open sidebar: songs dropped on one of the user's playlists go into it.
+            if let Source::Playlist(uri) = &source
+                && self.playlist(uri).is_some_and(|pl| pl.editable)
+                && let Some(songs) = super::dnd::drop_on(ui, &resp, cell, &p)
+            {
+                self.add_dropped_songs(uri.clone(), songs.uris);
+            }
             if resp.clicked() {
                 self.open_source(source, false);
             }
@@ -638,10 +905,11 @@ impl CodaApp {
         }
         let p = self.palette;
         egui::Area::new(Id::new("side-over")).order(Order::Foreground).fixed_pos(area.min).show(ctx, |ui| {
-            let rect = Rect::from_min_size(area.min, vec2(SIDE_W, area.height()));
-            ui.painter().add(egui::Shadow { offset: [18, 0], blur: 40, spread: 0, color: Color32::from_black_alpha(150) }.as_shape(rect, CornerRadius::ZERO));
-            ui.painter().rect_filled(rect, CornerRadius::ZERO, p.sidebar_bg);
-            ui.painter().vline(rect.right() - 0.5, rect.y_range(), Stroke::new(1.0, p.border));
+            let w = clamp_width(self.prefs.library_width, SIDE_W, SIDE_MIN, SIDE_MAX);
+            let rect = Rect::from_min_size(area.min + vec2(CARD_GAP, 0.0), vec2(w, area.height()));
+            let r = CornerRadius::same(CARD_R);
+            ui.painter().add(egui::Shadow { offset: [18, 0], blur: 40, spread: 0, color: Color32::from_black_alpha(150) }.as_shape(rect, r));
+            ui.painter().rect_filled(rect, r, p.sidebar_bg);
             let mut child = ui.new_child(egui::UiBuilder::new().max_rect(rect));
             child.set_clip_rect(rect);
             self.sidebar_full(&mut child);
@@ -652,16 +920,13 @@ impl CodaApp {
     /// search box in the middle, the avatar and the window buttons. Dragging its empty part moves the
     /// window; a double click maximises it.
     fn sign_bar(&mut self, ui: &mut Ui, l: &Layout) {
-        // Dark chrome in both themes.
-        let p = self.palette.on_dark();
+        // The window's base (Islands) in both themes, as the player bar under the cards.
+        let p = self.palette;
         let r = ui.max_rect();
         let narrow = l.mode == Mode::Narrow;
-        // Background: #1c1c20 to #151517, a 1 px line under it, a faint highlight along its top.
-        fin::vgradient(ui.painter(), r, Color32::from_rgb(28, 28, 32), Color32::from_rgb(21, 21, 23));
-        ui.painter().hline(r.x_range(), r.top() + 0.5, Stroke::new(1.0, Color32::from_white_alpha(13)));
-        ui.painter().hline(r.x_range(), r.bottom() - 0.5, Stroke::new(1.0, p.border));
+        ui.painter().rect_filled(r, CornerRadius::ZERO, p.base_bg());
 
-        let wc_left = window_controls(ui, r, narrow, false);
+        let wc_left = window_controls(ui, r, narrow, !p.dark);
         let cy = r.center().y;
 
         // Avatar: 28, 10 before the window buttons.
@@ -688,7 +953,10 @@ impl CodaApp {
         let wm_size = WORDMARK_SIZE * wm_scale;
         let wm = Rect::from_min_size(pos2(logo.right() + 10.0, cy - wm_size.y / 2.0 + 1.0), wm_size);
         let texture = self.frame.wordmark.get_or_insert_with(|| super::login::png_texture(ui.ctx(), "wordmark-bar", WORDMARK_BAR)).clone();
-        ui.painter().image(texture.id(), wm, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE);
+        // Light chrome on the dark base; on the light one the same chrome darkened (its white
+        // parts would vanish there).
+        let tint = if p.dark { Color32::WHITE } else { Color32::from_rgb(70, 74, 88) };
+        ui.painter().image(texture.id(), wm, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), tint);
         let brand = ui.interact(logo.union(wm), Id::new("sign-brand"), Sense::click()).on_hover_cursor(CursorIcon::PointingHand).on_hover_text("Home");
         if brand.clicked() {
             self.show_home();
@@ -697,10 +965,10 @@ impl CodaApp {
             return;
         }
 
-        // The sidebar button: at the end of a 278 zone when wide, 6 after the wordmark otherwise.
-        let side_x = if l.mode == Mode::Wide { r.left() + 14.0 + 278.0 - 30.0 } else { wm.right() + 6.0 + 4.0 };
+        // The sidebar button: at the open sidebar's right end (8 in), 6 after the wordmark otherwise.
+        let side_x = if l.side == Side::Open { (r.left() + l.side_w - 38.0).max(wm.right() + 6.0 + 4.0) } else { wm.right() + 6.0 + 4.0 };
         let side = Rect::from_min_size(pos2(side_x, cy - 15.0), vec2(30.0, 30.0));
-        let look = if l.mode != Mode::Wide && self.frame.side_over { Look::OnBox } else { Look::Plain };
+        let look = if l.side != Side::Open && self.frame.side_over { Look::OnBox } else { Look::Plain };
         if fin::ib(ui, &p, side, Id::new("sign-side"), "side", look, "Sidebar (Ctrl+B)").clicked() {
             self.cycle_sidebar(l.w);
         }
@@ -898,8 +1166,8 @@ impl CodaApp {
     }
 
     /// Self-shots leave the window as they found it: before the first, the page and windows are
-    /// noted; two seconds after the last, they are put back (the Shortcuts window and a song menu
-    /// opened for a picture close again).
+    /// noted; two seconds after the last, they are put back (the Shortcuts window, Now playing and a
+    /// song menu opened for a picture close again).
     fn shot_restore(&mut self, ctx: &egui::Context) {
         if !self.frame.shot_flags.is_empty() {
             if self.frame.shot_restore.is_none() {
@@ -908,6 +1176,8 @@ impl CodaApp {
                     source: self.view.as_ref().map(|v| v.source.clone()),
                     help: self.help_open,
                     settings: self.settings_open,
+                    stage: self.stage.open,
+                    lyrics_off: self.stage.lyrics_off,
                 });
             }
             self.frame.shot_ended_at = None;
@@ -926,6 +1196,11 @@ impl CodaApp {
         if self.settings_open && !r.settings {
             self.close_settings();
         }
+        // Now playing, opened for a picture, closes again.
+        if self.stage.open && !r.stage {
+            self.close_stage(ctx);
+        }
+        self.stage.lyrics_off = r.lyrics_off;
         if let Some(source) = r.source.filter(|s| self.view.as_ref().is_none_or(|v| v.source != *s)) {
             let recent = self.recent_sources.clone();
             self.open_source(source, false);
@@ -990,28 +1265,90 @@ fn top_first_cover(rect: Rect, bg: Color32, t: f32) -> egui::Shape {
 mod tests {
     use super::*;
 
+    fn want(side: f32, panel: f32) -> Want {
+        Want { side, panel, ..Want::default() }
+    }
+
+    fn widths(l: Layout) -> (Side, f32, f32) {
+        (l.side, l.side_w, l.panel_w)
+    }
+
     #[test]
-    fn folds_at_1200_and_760() {
-        let at = |w| layout(w, false, true, false);
-        assert_eq!((at(1440.0).side, at(1440.0).side_w, at(1440.0).panel_w), (Side::Open, 300.0, 340.0));
-        assert_eq!((at(1200.0).side, at(1200.0).panel_w), (Side::Open, 340.0));
-        // Below 1200 the full sidebar stays while the page keeps 560 beside it.
-        assert_eq!((at(1199.0).side, at(1199.0).side_w, at(1199.0).panel_w), (Side::Open, 300.0, 0.0));
-        assert_eq!(layout(1140.0, false, true, true).side, Side::Open);
-        assert_eq!(layout(1100.0, false, true, true).side, Side::Strip);
-        assert_eq!(layout(1199.0, true, true, false).side, Side::Strip);
-        assert_eq!(layout(960.0, false, true, true).panel_w, 280.0);
-        assert_eq!((at(760.0).side, at(759.0).side), (Side::Strip, Side::None));
-        assert_eq!(layout(1440.0, true, false, false).side_w, 56.0);
+    fn each_side_keeps_its_width_while_there_is_room() {
+        assert_eq!(widths(layout(1440.0, Want::default())), (Side::Open, 300.0, 340.0));
+        // The widths in prip's settings, at their window (1080 px at 85 %).
+        assert_eq!(widths(layout(1270.0, want(299.0, 333.0))), (Side::Open, 299.0, 333.0));
+        assert_eq!(widths(layout(2400.0, want(420.0, 480.0))), (Side::Open, 420.0, 480.0));
+    }
+
+    #[test]
+    fn the_panel_gives_way_first_then_the_sidebar() {
+        // The panel narrows first...
+        assert_eq!(widths(layout(1080.0, want(299.0, 333.0))), (Side::Open, 299.0, 301.0));
+        // ...then the sidebar...
+        assert_eq!(widths(layout(1000.0, want(299.0, 333.0))), (Side::Open, 260.0, 260.0));
+        // ...then the panel steps aside and the sidebar has its width back.
+        let l = layout(960.0, want(299.0, 333.0));
+        assert_eq!(widths(l), (Side::Open, 299.0, 0.0));
+        assert!(l.panel_squeezed && !l.side_squeezed);
+    }
+
+    #[test]
+    fn a_kept_panel_folds_the_sidebar_instead() {
+        let l = layout(960.0, Want { keep_panel: true, ..want(299.0, 333.0) });
+        assert_eq!(widths(l), (Side::Strip, 56.0, 333.0));
+        assert!(l.side_squeezed && !l.panel_squeezed);
+    }
+
+    #[test]
+    fn the_widths_come_back_with_the_room() {
+        let w = want(299.0, 333.0);
+        let before = widths(layout(1270.0, w));
+        assert_ne!(widths(layout(900.0, w)), before);
+        assert_eq!(widths(layout(1270.0, w)), before);
+    }
+
+    #[test]
+    fn the_sidebar_never_folds_on_its_own_and_the_page_keeps_its_room() {
+        for want in [Want::default(), want(420.0, 480.0), want(240.0, 260.0), Want { panel_open: false, ..Want::default() }] {
+            for k in 0..=1640 {
+                let w = 760.0 + k as f32;
+                let l = layout(w, want);
+                assert_eq!(l.side, Side::Open, "at {w}");
+                assert!(l.side_w >= SIDE_MIN && l.side_w <= SIDE_MAX, "at {w}");
+                assert!(l.panel_w == 0.0 || (PANEL_MIN..=PANEL_MAX).contains(&l.panel_w), "at {w}");
+                assert!(w - l.side_w - l.panel_w >= PAGE_MIN - 1.0, "at {w}: {l:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn widths_out_of_range_are_kept_in_it() {
+        assert_eq!(widths(layout(2400.0, want(10.0, 9999.0))), (Side::Open, 240.0, 480.0));
+        assert_eq!(widths(layout(2400.0, want(f32::NAN, f32::INFINITY))), (Side::Open, 300.0, 340.0));
+        assert_eq!(clamp_width(None, SIDE_W, SIDE_MIN, SIDE_MAX), 300.0);
+        assert_eq!(clamp_width(Some(333.4), PANEL_W, PANEL_MIN, PANEL_MAX), 333.0);
+    }
+
+    #[test]
+    fn folded_is_the_strip_and_narrow_has_neither() {
+        assert_eq!(widths(layout(1440.0, Want { folded: true, ..Want::default() })), (Side::Strip, 56.0, 340.0));
+        assert_eq!(widths(layout(900.0, Want { folded: true, ..Want::default() })), (Side::Strip, 56.0, 340.0));
+        assert_eq!(widths(layout(759.0, Want::default())), (Side::None, 0.0, 0.0));
+        assert_eq!(layout(759.0, Want::default()).mode, Mode::Narrow);
+        // Closed, the panel takes nothing and isn't squeezed.
+        let l = layout(1000.0, Want { panel_open: false, ..Want::default() });
+        assert_eq!(widths(l), (Side::Open, 300.0, 0.0));
+        assert!(!l.panel_squeezed);
     }
 
     #[test]
     fn the_search_box_shrinks_with_the_window() {
-        assert_eq!(layout(1440.0, false, true, false).search_w, 420.0);
-        assert_eq!(layout(1300.0, false, true, false).search_w, 420.0);
-        assert_eq!(layout(1200.0, false, true, false).search_w, 420.0);
-        assert_eq!(layout(960.0, false, true, false).search_w, 280.0);
-        assert_eq!(layout(830.0, false, true, false).search_w, 240.0);
-        assert_eq!(layout(780.0, false, true, false).search_w, 200.0);
+        assert_eq!(layout(1440.0, Want::default()).search_w, 420.0);
+        assert_eq!(layout(1300.0, Want::default()).search_w, 420.0);
+        assert_eq!(layout(1200.0, Want::default()).search_w, 420.0);
+        assert_eq!(layout(960.0, Want::default()).search_w, 280.0);
+        assert_eq!(layout(830.0, Want::default()).search_w, 240.0);
+        assert_eq!(layout(780.0, Want::default()).search_w, 200.0);
     }
 }

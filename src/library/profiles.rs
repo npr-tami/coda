@@ -77,6 +77,17 @@ pub fn user_page(username: &str, v: &Value) -> UserPage {
     }
 }
 
+/// How many people saved `uri`, from its owner's profile (`public_playlists`); `None` when it
+/// isn't there (a private playlist) or the profile doesn't say.
+pub fn playlist_likes(v: &Value, uri: &str) -> Option<u32> {
+    let want = uri.rsplit(':').next().unwrap_or(uri);
+    let p = v["public_playlists"].as_array()?.iter().find(|p| text(&p["uri"]).rsplit(':').next() == Some(want))?;
+    count(&p["followers_count"])
+        .or_else(|| count(&p["followersCount"]))
+        .or_else(|| count(&p["followers"]))
+        .or_else(|| count(&p["followers"]["total"]))
+}
+
 /// The people (and artists) in `/followers` or `/following`.
 pub fn people(v: &Value) -> Vec<Card> {
     v["profiles"].as_array().into_iter().flatten().filter_map(person).collect()
@@ -86,6 +97,20 @@ pub fn people(v: &Value) -> Vec<Card> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn a_playlists_likes_come_from_its_owners_profile() {
+        let v = json!({ "public_playlists": [
+            { "uri": "spotify:playlist:a", "name": "care", "followers_count": 12 },
+            { "uri": "spotify:user:wisp:playlist:b", "name": "late", "followers_count": 0 },
+            { "uri": "spotify:playlist:c", "name": "orax" }
+        ]});
+        assert_eq!(playlist_likes(&v, "spotify:playlist:a"), Some(12));
+        assert_eq!(playlist_likes(&v, "spotify:playlist:b"), Some(0), "an old style uri is the same playlist");
+        assert_eq!(playlist_likes(&v, "spotify:playlist:c"), None, "no count said");
+        assert_eq!(playlist_likes(&v, "spotify:playlist:private"), None, "not public");
+        assert_eq!(playlist_likes(&json!({}), "spotify:playlist:a"), None);
+    }
 
     #[test]
     fn a_profile_page_reads_counts_playlists_and_artists() {

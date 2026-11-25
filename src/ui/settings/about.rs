@@ -178,12 +178,12 @@ pub(super) fn card(ui: &mut Ui, title: Option<&str>, add: impl FnOnce(&mut Ui)) 
     let p = crate::ui::theme::palette(ui.ctx());
     if let Some(title) = title {
         ui.add_space(TITLE_TOP - CARD_GAP);
-        let t = layout(ui, &[(title, bold(13.0), p.text_weak)], LEADING, ui.available_width() - 4.0, true);
+        let t = layout(ui, &[(title, bold(12.0), p.text)], LEADING, ui.available_width() - 4.0, true);
         let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), t.h), Sense::hover());
         paint_text(ui.painter(), rect.min + vec2(2.0, 0.0), t);
         ui.add_space(TITLE_BELOW);
     }
-    Frame::new().fill(p.raised_bg).stroke(Stroke::new(1.0, p.border)).corner_radius(CornerRadius::same(8)).show(ui, |ui| {
+    Frame::new().fill(crate::ui::kit::card_bg(&p)).corner_radius(CornerRadius::same(crate::ui::kit::CARD_RADIUS)).show(ui, |ui| {
         ui.set_width(ui.available_width());
         ui.spacing_mut().item_spacing.y = 0.0;
         add(ui);

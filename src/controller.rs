@@ -250,6 +250,12 @@ struct Controller {
     interruptions: u32,
     /// Reconnects waited for because of the current track.
     reconnect_waits: u32,
+    /// When songs last failed on Spotify, within `playback::OUTAGE_WINDOW`: while several fail
+    /// close together none of them is greyed out.
+    recent_failures: Vec<Instant>,
+    /// Songs Spotify refused in a row (it answers about them, but won't stream them): skipped
+    /// quietly, up to `playback::MAX_REFUSED_IN_ROW`.
+    refused_in_row: u32,
 
     // --- Audio extras (see `extras`) ---
     /// Crossfade length in milliseconds; 0 = off (gapless).
@@ -396,6 +402,8 @@ impl Controller {
             last_reachable: None,
             interruptions: 0,
             reconnect_waits: 0,
+            recent_failures: Vec::new(),
+            refused_in_row: 0,
             crossfade_ms: u32::from(crossfade_secs) * 1000,
             youtube,
             source_problem: None,
@@ -460,6 +468,7 @@ impl Controller {
             }
             Command::OpenSource { source, force_refresh } => self.cmd_open_source(source, force_refresh),
             Command::PlaySource { source, start_index, shuffle } => self.cmd_play_source(source, start_index, shuffle),
+            Command::PlayInOrder { source, order, start_index } => self.cmd_play_in_order(source, order, start_index),
             Command::NewRound { source } => self.cmd_new_round(source),
             Command::PlayPause => self.cmd_play_pause(),
             Command::Next => self.cmd_next(),
@@ -501,18 +510,24 @@ impl Controller {
             Command::SearchUsers { query, offset } => self.cmd_search_users(query, offset),
             Command::Lyrics(uri) => self.cmd_lyrics(uri),
             Command::Canvas(uri) => self.cmd_canvas(uri),
+            Command::FindTrack(uri) => self.cmd_find_track(uri),
             Command::HeldBy(uris) => self.cmd_held_by(uris),
             Command::PlayStats => self.cmd_play_stats(),
             Command::Helpers => self.cmd_helpers(),
             Command::Collection => self.cmd_collection(),
             Command::Queue { track, next } => self.cmd_queue(*track, next),
             Command::Unqueue(at) => self.cmd_unqueue(at),
+            Command::MoveQueued { from, to } => self.cmd_move_queued(from, to),
             Command::AddToPlaylist { playlist_uri, uris, again, question } => self.cmd_add_new(playlist_uri, uris, again, question),
             Command::RemoveFromPlaylist { playlist_uri, uris } => self.cmd_remove_items(playlist_uri, uris),
+            Command::MovePlaylistSong { playlist_uri, before, from, to } => self.cmd_move_playlist_song(playlist_uri, before, from, to),
             Command::FindDuplicates(uri) => self.cmd_find_duplicates(uri),
             Command::RemoveDuplicates { playlist_uri, tracks, rows } => self.cmd_remove_duplicates(playlist_uri, tracks, rows),
             Command::CreatePlaylist { name } => self.cmd_create_playlist(name),
             Command::RemovePlaylist { uri } => self.cmd_remove_playlist(uri),
+            Command::AddPlaylist { uri } => self.cmd_add_playlist(uri),
+            Command::PlaylistDetails(uri) => self.cmd_playlist_details(uri),
+            Command::DeleteLinkPlaylist(uri) => self.cmd_delete_link_playlist(uri),
             Command::ListenAlong { how, name } => self.cmd_listen_along(how, name),
             Command::ListenStop => self.end_listening(None),
             Command::ListenShare(on) => self.cmd_listen_share(on),
@@ -626,6 +641,11 @@ impl Controller {
     /// queue's state there.
     fn check_selftest(&mut self) {
         let Some(dir) = std::env::current_exe().ok().and_then(|p| p.parent().map(std::path::Path::to_path_buf)) else { return };
+        // A self-shot asked for while nothing moves on screen (paused, idle): the window draws
+        // again so it sees the request.
+        if dir.join("coda-shot.request").exists() {
+            self.ui.ctx.request_repaint();
+        }
         let request = dir.join("coda-selftest.request");
         if !request.exists() {
             return;
@@ -735,6 +755,16 @@ impl Controller {
             tokio::spawn(async move {
                 let report = youtube_test(library, youtube, source, count.unwrap_or(20)).await;
                 log::info!("self-test:
+{report}");
+                let _ = std::fs::write(dir.join("coda-selftest.txt"), report);
+            });
+            return;
+        }
+        if mode == "playlist likes" {
+            let lists: Vec<(String, String)> = self.playlists.iter().map(|p| (p.uri.clone(), p.name.clone())).collect();
+            tokio::spawn(async move {
+                let report = crate::library::selftest::playlist_likes(library, lists).await;
+                log::info!("self-test playlist likes:
 {report}");
                 let _ = std::fs::write(dir.join("coda-selftest.txt"), report);
             });

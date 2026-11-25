@@ -172,8 +172,10 @@ impl Palette {
                 accent_ink: Color32::from_rgb(227, 38, 45),
                 // The Final design's tokens: tb, bg, panel, btn, input, line, hov, text, bright,
                 // muted and dis.
-                sidebar_bg: Color32::from_rgb(21, 21, 23),
-                main_bg: Color32::from_rgb(14, 14, 16),
+                // Islands: the sidebar, the page and the side panel are one fill, on a near-black
+                // base (`base_bg`).
+                sidebar_bg: Color32::from_rgb(19, 19, 21),
+                main_bg: Color32::from_rgb(19, 19, 21),
                 bar_bg: Color32::from_rgb(21, 21, 23),
                 raised_bg: Color32::from_rgb(27, 27, 30),
                 placeholder: Color32::from_rgb(35, 35, 39),
@@ -203,8 +205,8 @@ impl Palette {
                 accent: Color32::from_rgb(227, 38, 45),
                 on_accent: Color32::WHITE,
                 accent_ink: Color32::from_rgb(227, 38, 45),
-                sidebar_bg: Color32::from_rgb(233, 233, 236),
-                main_bg: Color32::from_rgb(245, 245, 247),
+                sidebar_bg: Color32::from_rgb(249, 249, 250),
+                main_bg: Color32::from_rgb(249, 249, 250),
                 bar_bg: Color32::from_rgb(238, 238, 241),
                 raised_bg: Color32::WHITE,
                 placeholder: Color32::from_rgb(220, 220, 225),
@@ -230,6 +232,34 @@ impl Palette {
                 window_stroke: Color32::from_rgb(214, 214, 220),
             }
         }
+    }
+
+    /// The window's base (Islands), under and between the cards (the sidebar, the page, the side
+    /// panel), and under the title bar and the player bar: near-black on the dark theme, a grey
+    /// a step below the cards on the light one.
+    pub fn base_bg(&self) -> Color32 {
+        if self.dark { mix(self.main_bg, Color32::BLACK, 0.68) } else { mix(self.main_bg, Color32::BLACK, 0.085) }
+    }
+
+    /// Settings' own window: the page's fill on the dark theme; a step below it on the light one,
+    /// so its white cards stand out (Islands).
+    pub fn settings_bg(&self) -> Color32 {
+        if self.dark { self.main_bg } else { mix(self.main_bg, Color32::BLACK, 0.045) }
+    }
+
+    /// The page card's slight lift: its top this much lighter, fading to `main_bg` (Islands).
+    pub fn page_lift(&self) -> Color32 {
+        if self.dark { mix(self.main_bg, Color32::WHITE, 0.03) } else { mix(self.main_bg, Color32::WHITE, 0.6) }
+    }
+
+    /// A chip that is picked (Islands): a light fill with dark words on the dark theme, the other
+    /// way round on the light one.
+    pub fn chip_on_bg(&self) -> Color32 {
+        self.text
+    }
+
+    pub fn chip_on_ink(&self) -> Color32 {
+        super::util::contrast_text(self.text)
     }
 
     /// The palette for parts drawn on something dark in both themes (a banner's shade, the record
@@ -290,8 +320,8 @@ impl Palette {
             self.widget_hover_bg = shade(0.15);
             self.widget_active_bg = shade(0.2);
             self.border = shade(0.15);
-            // Panels sit a little darker than the main area, as in the base themes.
-            self.sidebar_bg = mix(bg, Color32::BLACK, if dark { 0.38 } else { 0.04 });
+            // Islands: the panels are the same cards as the page.
+            self.sidebar_bg = bg;
             self.bar_bg = mix(bg, Color32::BLACK, if dark { 0.22 } else { 0.065 });
             if c.text.is_none() {
                 self.text = if dark { Color32::from_rgb(222, 222, 226) } else { Color32::from_rgb(28, 28, 32) };
@@ -472,7 +502,7 @@ pub fn palette(ctx: &egui::Context) -> Palette {
 
 fn build_visuals(p: &Palette) -> Visuals {
     let mut v = if p.dark { Visuals::dark() } else { Visuals::light() };
-    let radius = CornerRadius::same(6);
+    let radius = CornerRadius::same(8);
     v.panel_fill = p.main_bg;
     v.window_fill = p.raised_bg;
     v.faint_bg_color = p.faint_bg;
@@ -486,8 +516,8 @@ fn build_visuals(p: &Palette) -> Visuals {
     v.error_fg_color = p.error;
     // Hints in text boxes.
     v.weak_text_color = Some(p.text_weak);
-    v.window_corner_radius = CornerRadius::same(8);
-    v.menu_corner_radius = CornerRadius::same(8);
+    v.window_corner_radius = CornerRadius::same(12);
+    v.menu_corner_radius = CornerRadius::same(10);
     v.window_stroke = Stroke::new(1.0, p.window_stroke);
     v.window_shadow = Shadow { offset: [0, 10], blur: 28, spread: 0, color: Color32::from_black_alpha(if p.dark { 140 } else { 50 }) };
     v.popup_shadow = Shadow { offset: [0, 16], blur: 44, spread: 0, color: Color32::from_black_alpha(if p.dark { 166 } else { 50 }) };
@@ -918,20 +948,20 @@ mod tests {
                 ("the open nav row", p.chosen_bg, Box::new(move |ui, p| { let _ = sidebar::nav_row(ui, p, row, "home", "Home", true, None); })),
                 (
                     "an empty search box",
-                    p.field_bg,
+                    p.widget_bg,
                     Box::new(move |ui, p| { let _ = fin::search_box(ui, p, field, Id::new("s"), &mut String::new(), "Filter playlists", "Ctrl+L"); }),
                 ),
-                ("a search box", p.field_bg, Box::new(move |ui, p| { let _ = fin::search_box(ui, p, field, Id::new("s"), &mut "care".to_owned(), "Filter songs", "Ctrl+F"); })),
+                ("a search box", p.widget_bg, Box::new(move |ui, p| { let _ = fin::search_box(ui, p, field, Id::new("s"), &mut "care".to_owned(), "Filter songs", "Ctrl+F"); })),
                 (
                     "the title bar's search box",
-                    p.on_dark().field_bg,
+                    p.on_dark().widget_bg,
                     Box::new(move |ui, p| { let _ = fin::search_box(ui, &p.on_dark(), field, Id::new("s"), &mut String::new(), "Search songs", "Ctrl+K"); }),
                 ),
                 ("a button that is on, in a box", p.widget_hover_bg, Box::new(move |ui, p| { let _ = fin::ib(ui, p, button, Id::new("b"), "grid", fin::Look::OnBox, ""); })),
                 ("a button that is on", p.bar_bg, Box::new(move |ui, p| { let _ = fin::ib(ui, p, button, Id::new("b"), "grid", fin::Look::On, ""); })),
                 ("a liked heart", p.main_bg, Box::new(move |ui, p| { let _ = fin::heart(ui, p, button, Id::new("h"), true, ""); })),
                 ("a chip", p.widget_bg, Box::new(|ui, p| { let _ = fin::chip(ui, p, pos2(8.0, 30.0), Id::new("c"), "Playlists", None, false, false); })),
-                ("a chip that is on", p.main_bg.blend(fin::acc(&p, 0.16)), Box::new(|ui, p| { let _ = fin::chip(ui, p, pos2(8.0, 30.0), Id::new("c"), "Mine", None, true, false); })),
+                ("a chip that is on", p.chip_on_bg(), Box::new(|ui, p| { let _ = fin::chip(ui, p, pos2(8.0, 30.0), Id::new("c"), "Mine", None, true, false); })),
                 ("a button", p.widget_bg, Box::new(|ui, p| { let _ = fin::text_button(ui, p, pos2(8.0, 10.0), Id::new("b"), "Reshuffle", Some("shuffle"), false, true); })),
                 ("a menu row", p.raised_bg, Box::new(|ui, _| { let _ = fin::menu_item(ui, Some("plus"), "Add to queue", Some("Ctrl+Q"), false, true); })),
                 ("a menu row that is on", p.raised_bg, Box::new(|ui, _| { let _ = fin::menu_item(ui, None, "Shuffle", None, true, true); })),
@@ -944,7 +974,7 @@ mod tests {
                     }),
                 ),
                 ("a dialog's text box", p.field_bg, Box::new(|ui, p| { let _ = fin::field(ui, p, egui::TextEdit::singleline(&mut String::new()).hint_text("Playlist name")); })),
-                ("a settings row", p.sidebar_bg, Box::new(|ui, p| { let _ = kit::switch_row(ui, p, "Show the record", Some("Ctrl+D hides it"), &mut true, false, true); })),
+                ("a settings row", kit::card_bg(&p), Box::new(|ui, p| { let _ = kit::switch_row(ui, p, "Show the record", Some("Ctrl+D hides it"), &mut true, false, true); })),
             ];
             for (what, bg, draw) in &cases {
                 let words = painted_words(&p, |ui| draw(ui, &p));

@@ -7,7 +7,10 @@
 //! - Opening never panics and never fails: if there is no device the problem is reported and the
 //!   output stays closed, so the first `write` fails and librespot pauses (see `start`).
 //! - If the device stops taking samples (unplugged mid-song), `write` notices within
-//!   `STALL_TIMEOUT` instead of waiting forever, and the player pauses.
+//!   `STALL_TIMEOUT` instead of waiting forever. It then waits up to `RETURN_WINDOW` for that same
+//!   device to come back (a USB hub or DAC that resets itself drops out for a few seconds) and
+//!   carries on there; only if it stays gone does the player pause. It never moves to another
+//!   device by itself, so unplugged headphones don't continue on the speakers.
 //! - Each packet is equalized in place as it is written (see [`Equalizer`]); fades are applied
 //!   while it plays (see [`PacketSource`] and `gain`).
 //! - librespot's audio is always 44.1 kHz. A YouTube song may have another rate: the equalizer is
@@ -33,12 +36,16 @@ const MAX_QUEUED_CHUNKS: usize = 26;
 /// No progress for this long means the device is gone.
 const STALL_TIMEOUT: Duration = Duration::from_secs(2);
 const POLL_INTERVAL: Duration = Duration::from_millis(10);
+/// How long a device that stopped is waited for before the player pauses.
+const RETURN_WINDOW: Duration = Duration::from_secs(8);
+/// How often the waiting looks for the device.
+const RETURN_POLL: Duration = Duration::from_millis(250);
 /// The playing gain is re-read this often (in samples, ~1.5 ms) and glided to linearly.
 const GAIN_BLOCK: u32 = 128;
 
 const NO_DEVICE: &str = "No speakers or headphones were found. Connect an audio device and press play.";
 const OPEN_FAILED: &str = "coda couldn't use your speakers or headphones. Check the Windows sound settings and press play.";
-const DEVICE_LOST: &str = "The audio device stopped responding (was it unplugged?). Press play to continue on your current speakers or headphones.";
+const DEVICE_LOST: &str = "Your speakers or headphones disconnected and didn't come back. Press play to continue on the ones Windows uses now.";
 
 /// Last audio problem, in plain language, for the controller to show.
 pub(super) type ProblemSlot = Arc<Mutex<Option<String>>>;
@@ -52,22 +59,50 @@ pub(super) struct SinkParts {
 
 struct Output {
     queue: rodio::Sink,
-    _stream: rodio::OutputStream,
+    /// `None` only in tests.
+    _stream: Option<rodio::OutputStream>,
     /// Set by the stream's error callback (device invalidated, driver error).
     failed: Arc<AtomicBool>,
+    /// The device's name, to find it again if it drops out.
+    device: Option<String>,
 }
 
 impl Output {
+    /// Opens Windows' default output device.
     fn open() -> Result<Self, String> {
-        let failed = Arc::new(AtomicBool::new(false));
-        let flag = failed.clone();
-        let builder = rodio::OutputStreamBuilder::from_default_device().map_err(|e| {
+        let device = {
+            use rodio::cpal::traits::HostTrait;
+            rodio::cpal::default_host().default_output_device()
+        };
+        let name = device.as_ref().and_then(device_name);
+        let builder = match device {
+            Some(device) => rodio::OutputStreamBuilder::from_device(device),
+            None => Err(rodio::StreamError::NoDevice),
+        };
+        let builder = builder.map_err(|e| {
             log::warn!("no usable audio output device: {e}");
             match e {
                 rodio::StreamError::NoDevice => NO_DEVICE.to_owned(),
                 _ => OPEN_FAILED.to_owned(),
             }
         })?;
+        Self::open_with(builder, name)
+    }
+
+    /// Opens the output device called `name`, if it is there.
+    fn reopen(name: &str) -> Option<Self> {
+        use rodio::cpal::traits::HostTrait;
+        let device = rodio::cpal::default_host()
+            .output_devices()
+            .ok()?
+            .find(|d| device_name(d).as_deref() == Some(name))?;
+        let builder = rodio::OutputStreamBuilder::from_device(device).ok()?;
+        Self::open_with(builder, Some(name.to_owned())).ok()
+    }
+
+    fn open_with(builder: rodio::OutputStreamBuilder, device: Option<String>) -> Result<Self, String> {
+        let failed = Arc::new(AtomicBool::new(false));
+        let flag = failed.clone();
         let builder = builder.with_error_callback(move |e: rodio::cpal::StreamError| {
             log::warn!("audio output error: {e}");
             flag.store(true, Ordering::Release);
@@ -78,13 +113,17 @@ impl Output {
         })?;
         stream.log_on_drop(false);
         let queue = rodio::Sink::connect_new(stream.mixer());
-        log::debug!("audio output opened ({:?})", stream.config());
-        Ok(Self { queue, _stream: stream, failed })
+        log::debug!("audio output opened on {device:?} ({:?})", stream.config());
+        Ok(Self { queue, _stream: Some(stream), failed, device })
     }
 
     /// Waits until at most `max_chunks` packets are queued. Returns `false` if the device
     /// stopped consuming audio.
     fn wait_until_queued_at_most(&self, max_chunks: usize) -> bool {
+        self.wait_until_queued_at_most_within(max_chunks, STALL_TIMEOUT)
+    }
+
+    fn wait_until_queued_at_most_within(&self, max_chunks: usize, stall_timeout: Duration) -> bool {
         let mut last_len = usize::MAX;
         let mut last_progress = Instant::now();
         loop {
@@ -98,13 +137,27 @@ impl Output {
             if len < last_len {
                 last_len = len;
                 last_progress = Instant::now();
-            } else if last_progress.elapsed() >= STALL_TIMEOUT {
+            } else if last_progress.elapsed() >= stall_timeout {
                 return false;
             }
             thread::sleep(POLL_INTERVAL);
         }
     }
 }
+
+fn device_name(device: &rodio::cpal::Device) -> Option<String> {
+    use rodio::cpal::traits::DeviceTrait;
+    device.name().ok()
+}
+
+/// How long `CodaSink` waits for a device (shortened in tests).
+struct Timing {
+    stall: Duration,
+    return_window: Duration,
+    return_poll: Duration,
+}
+
+const TIMING: Timing = Timing { stall: STALL_TIMEOUT, return_window: RETURN_WINDOW, return_poll: RETURN_POLL };
 
 pub(super) struct CodaSink {
     output: Option<Output>,
@@ -116,6 +169,9 @@ pub(super) struct CodaSink {
     rate: u32,
     /// Opens the output device (`Output::open`; replaced in tests).
     open: fn() -> Result<Output, String>,
+    /// Opens a named device again after it dropped out (`Output::reopen`; replaced in tests).
+    reopen: fn(&str) -> Option<Output>,
+    timing: Timing,
 }
 
 impl CodaSink {
@@ -125,7 +181,31 @@ impl CodaSink {
 
     fn with_opener(parts: SinkParts, open: fn() -> Result<Output, String>) -> Self {
         let eq = Equalizer::new(&parts.eq);
-        Self { output: None, problem: parts.problem, gain: parts.gain, eq_control: parts.eq, eq, rate: SAMPLE_RATE, open }
+        Self {
+            output: None,
+            problem: parts.problem,
+            gain: parts.gain,
+            eq_control: parts.eq,
+            eq,
+            rate: SAMPLE_RATE,
+            open,
+            reopen: Output::reopen,
+            timing: TIMING,
+        }
+    }
+
+    /// Waits up to the return window for the device called `name` to be back, and opens it.
+    fn wait_for_return(&self, name: &str) -> Option<Output> {
+        let deadline = Instant::now() + self.timing.return_window;
+        loop {
+            thread::sleep(self.timing.return_poll);
+            if let Some(output) = (self.reopen)(name) {
+                return Some(output);
+            }
+            if Instant::now() >= deadline {
+                return None;
+            }
+        }
     }
 
     /// The packets written from now on have `rate` samples per second.
@@ -193,13 +273,23 @@ impl Sink for CodaSink {
             self.eq.sync(&self.eq_control);
             self.eq.process(&mut samples);
             output.queue.append(PacketSource::new(converter.f64_to_f32(&samples), self.gain.clone(), self.rate));
-            output.wait_until_queued_at_most(MAX_QUEUED_CHUNKS)
+            output.wait_until_queued_at_most_within(MAX_QUEUED_CHUNKS, self.timing.stall)
         };
         if healthy {
             return Ok(());
         }
-        log::warn!("the audio device stopped taking samples; pausing");
-        self.output = None;
+        let device = self.output.take().and_then(|o| o.device);
+        if let Some(name) = device {
+            log::warn!("the audio device {name:?} stopped taking samples; waiting for it to come back");
+            if let Some(output) = self.wait_for_return(&name) {
+                // The ~0.5 s queued on the old output is lost; the song goes on from here.
+                log::info!("the audio device {name:?} is back; playing on");
+                self.eq.reset();
+                self.output = Some(output);
+                return Ok(());
+            }
+        }
+        log::warn!("the audio device stopped taking samples and didn't come back; pausing");
         self.report(DEVICE_LOST);
         Err(SinkError::OnWrite("the audio device stopped responding".into()))
     }
@@ -321,6 +411,63 @@ mod tests {
 
     fn no_device() -> Result<Output, String> {
         Err(NO_DEVICE.to_owned())
+    }
+
+    /// An output nothing plays from, like a device that stopped taking samples.
+    fn stuck_output(device: &str) -> Output {
+        let (queue, _never_played) = rodio::Sink::new();
+        Output { queue, _stream: None, failed: Arc::new(AtomicBool::new(false)), device: Some(device.to_owned()) }
+    }
+
+    fn stuck_headphones() -> Result<Output, String> {
+        Ok(stuck_output("Headphones (USB DAC)"))
+    }
+
+    const FAST: Timing = Timing {
+        stall: Duration::from_millis(100),
+        return_window: Duration::from_millis(300),
+        return_poll: Duration::from_millis(20),
+    };
+
+    /// Fills a stuck output past the queue limit, so the next packet finds it stalled.
+    fn write_until_stalled(sink: &mut CodaSink) -> SinkResult<()> {
+        let mut converter = Converter::new(None);
+        for _ in 0..=MAX_QUEUED_CHUNKS {
+            sink.write(AudioPacket::Samples(vec![0.0; 64]), &mut converter)?;
+        }
+        Ok(())
+    }
+
+    /// A USB DAC whose hub resets drops off for a few seconds and comes back under the same
+    /// name: the song keeps playing there, and no problem is shown.
+    #[test]
+    fn a_device_that_drops_out_and_comes_back_keeps_playing() {
+        let problem = ProblemSlot::default();
+        let mut sink = CodaSink::with_opener(parts(problem.clone()), stuck_headphones);
+        sink.timing = FAST;
+        sink.reopen = |name| (name == "Headphones (USB DAC)").then(|| stuck_output(name));
+        sink.start().expect("start");
+        write_until_stalled(&mut sink).expect("the stall is ridden out on the returned device");
+        assert!(sink.output.is_some(), "playing on the device that came back");
+        assert_eq!(lock(&problem).as_deref(), None, "nothing to tell the person");
+    }
+
+    /// Unplugged for good: the player pauses with the reason, and never moves on to another
+    /// device by itself.
+    #[test]
+    fn a_device_that_stays_gone_pauses_with_the_reason() {
+        let problem = ProblemSlot::default();
+        let mut sink = CodaSink::with_opener(parts(problem.clone()), stuck_headphones);
+        sink.timing = FAST;
+        sink.reopen = |_| None;
+        sink.start().expect("start");
+        let started = Instant::now();
+        let written = write_until_stalled(&mut sink);
+        assert!(matches!(written, Err(SinkError::OnWrite(_))), "{written:?}");
+        assert!(started.elapsed() >= FAST.stall + FAST.return_window, "waited for it first");
+        assert!(sink.output.is_none());
+        assert_eq!(lock(&problem).as_deref(), Some(DEVICE_LOST));
+        sink.stop().expect("stop after the failed write");
     }
 
     fn parts(problem: ProblemSlot) -> SinkParts {

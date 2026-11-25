@@ -192,7 +192,9 @@ impl Item {
             Item::ListenAlong => "listen along friends tab share sharing together what you play link links copy invite join kick remove let back in rename new",
             Item::Editing => "editing playlists web api client id developer rename covers connect spotify",
             Item::Lastfm => "last.fm lastfm scrobble scrobbling api key secret",
-            Item::Discord => "discord status listening presence",
+            Item::Discord => {
+                "discord status listening presence top bottom line template title artist album playlist member list paused pause progress bar picture cover icon badge play sign button open on spotify link hide hidden from"
+            }
             Item::KeepRunning => "keep playing running background close window quit",
             Item::Tray => "tray icon notification area",
             Item::StartWithWindows => "start with windows startup sign in",
@@ -300,11 +302,14 @@ fn eq_slider(ui: &mut Ui, p: &super::theme::Palette, value: &mut f32, range: std
     let (rect, mut resp) = ui.allocate_exact_size(vec2(20.0, EQ_SLIDER_LENGTH), Sense::click_and_drag());
     let (lo, hi) = (*range.start(), *range.end());
     let span = (hi - lo).max(f32::EPSILON);
-    let y_of = |v: f32| rect.bottom() - (v - lo) / span * rect.height();
+    // The knob (5.5 across) stays inside the slider's rect at either end, clear of the value above it
+    // and the band's name under it.
+    let track = rect.shrink2(vec2(0.0, 6.0));
+    let y_of = |v: f32| track.bottom() - (v - lo) / span * track.height();
     if (resp.dragged() || resp.is_pointer_button_down_on())
         && let Some(pos) = resp.interact_pointer_pos()
     {
-        let t = ((rect.bottom() - pos.y) / rect.height()).clamp(0.0, 1.0);
+        let t = ((track.bottom() - pos.y) / track.height()).clamp(0.0, 1.0);
         let v = ((lo + t * span) * 2.0).round() / 2.0;
         if (v - *value).abs() > f32::EPSILON {
             *value = v;
@@ -465,7 +470,7 @@ impl CodaApp {
             self.settings_query.clear();
         }
         let p = self.palette;
-        ui.painter().rect_filled(ui.max_rect(), 0.0, p.main_bg);
+        ui.painter().rect_filled(ui.max_rect(), 0.0, p.settings_bg());
         self.settings_contents(ui);
         self.licences_modal(ui.ctx());
     }
@@ -479,9 +484,8 @@ impl CodaApp {
         let nav = Rect::from_min_max(full.min, pos2(full.left() + if narrow { STRIP_W } else { NAV_W }, full.bottom()));
         let body = Rect::from_min_max(pos2(nav.right(), full.top()), full.max);
 
+        // Islands: the section list sits on the page card itself, no line beside it.
         let painter = ui.painter().clone();
-        painter.rect_filled(nav, CornerRadius::ZERO, p.sidebar_bg);
-        painter.vline(nav.right() - 0.5, nav.y_range(), Stroke::new(1.0, p.border));
 
         let searching = !self.settings_query.trim().is_empty();
         let mut y = full.top();
@@ -511,8 +515,7 @@ impl CodaApp {
             // The highlight slides to the page picked (and fades while searching).
             let picked = Page::ALL.iter().position(|&page| page == self.settings_page && !searching).map(|k| (k, row_at(k)));
             motion::marker(ui.ctx(), Id::new("settings-nav-mark"), nav.min, picked, motion::TAB, |row, a| {
-                painter.rect_filled(row, CornerRadius::same(6), fin::acc(&p, 0.16).gamma_multiply(a));
-                painter.rect_filled(Rect::from_min_size(row.min, vec2(3.0, row.height())), CornerRadius { nw: 6, sw: 6, ne: 0, se: 0 }, p.accent_ink.gamma_multiply(a));
+                painter.rect_filled(row, CornerRadius::same(8), p.chosen_bg.gamma_multiply(a));
             });
             for (k, page) in Page::ALL.into_iter().enumerate() {
                 let row = row_at(k);
@@ -520,7 +523,7 @@ impl CodaApp {
                 let chosen = page == self.settings_page && !searching;
                 let hover = motion::color(ui.ctx(), resp.id, if !chosen && resp.hovered() { p.hover_bg } else { Color32::TRANSPARENT }, motion::HOVER);
                 if hover.a() > 0 {
-                    painter.rect_filled(row, CornerRadius::same(6), hover);
+                    painter.rect_filled(row, CornerRadius::same(8), hover);
                 }
                 let icon = Rect::from_min_size(pos2(row.left() + 12.0, row.center().y - 8.0), vec2(16.0, 16.0));
                 svgicon::paint(&painter, icon, page.icon(), motion::color(ui.ctx(), resp.id.with("icon"), if chosen { p.accent_ink } else { p.text_weak }, motion::HOVER), svgicon::STROKE);
@@ -1113,6 +1116,9 @@ impl CodaApp {
             // The connection changes on its own (Discord starting or closing): keep the text fresh.
             ui.ctx().request_repaint_after(DISCORD_STATUS_REFRESH);
         }
+        if self.prefs.discord_status {
+            self.discord_look(ui);
+        }
         kit::card_body(ui, &p, |ui| {
             // Coda brings its own Discord application; one of the user's own only changes the
             // name shown, so its setup stays folded away.
@@ -1122,6 +1128,96 @@ impl CodaApp {
                 .default_open(own)
                 .show(ui, |ui| self.discord_setup(ui));
         });
+    }
+
+    /// How the Discord status looks (shown while it is on). The defaults look as it always did.
+    fn discord_look(&mut self, ui: &mut Ui) {
+        use crate::config::{DiscordLook, DiscordPaused, DiscordPicture, DiscordShows};
+        let p = self.palette;
+        let mut look = self.prefs.discord_look.clone();
+        let mut hidden = self.prefs.discord_hidden;
+        if kit::switch_row(ui, &p, "Hide from Discord for now", Some("Also in the player bar's menu and the tray"), &mut hidden, true, true) {
+            self.toggle_discord_hidden();
+            return;
+        }
+        let words = "Use {title} {artist} {album} {playlist}";
+        for (title, line, default, salt) in [
+            ("Top line", &mut look.top, DiscordLook::TOP, "discord_top"),
+            ("Bottom line", &mut look.bottom, DiscordLook::BOTTOM, "discord_bottom"),
+        ] {
+            kit::row(ui, &p, title, Some(words), true, true, 220.0, |ui| {
+                // Discord takes 128 characters a line; longer ones are cut with "…".
+                text_field(
+                    ui,
+                    &p,
+                    TextEdit::singleline(line)
+                        .id_salt(salt)
+                        .hint_text(default)
+                        .char_limit(128)
+                        .desired_width(210.0)
+                        .margin(Margin::symmetric(8, 5)),
+                );
+            });
+        }
+        let shows = |s: DiscordShows| match s {
+            DiscordShows::App => "Listening to coda",
+            DiscordShows::Song => "The song",
+            DiscordShows::Artist => "The artist",
+        };
+        kit::row(ui, &p, "In the member list", Some("What friends see next to your name"), true, true, 180.0, |ui| {
+            egui::ComboBox::from_id_salt("discord_shows").selected_text(shows(look.shows)).width(170.0).show_ui(ui, |ui| {
+                for s in [DiscordShows::App, DiscordShows::Song, DiscordShows::Artist] {
+                    fin::choice(ui, &mut look.shows, s, shows(s));
+                }
+            });
+        });
+        let paused = |s: DiscordPaused| match s {
+            DiscordPaused::Clear => "Take the status away",
+            DiscordPaused::Keep => "Keep it, marked Paused",
+        };
+        kit::row(ui, &p, "When paused", None, true, true, 180.0, |ui| {
+            egui::ComboBox::from_id_salt("discord_paused").selected_text(paused(look.paused)).width(170.0).show_ui(ui, |ui| {
+                for s in [DiscordPaused::Clear, DiscordPaused::Keep] {
+                    fin::choice(ui, &mut look.paused, s, paused(s));
+                }
+            });
+        });
+        kit::switch_row(ui, &p, "Progress bar", None, &mut look.progress, true, true);
+        let picture = |s: DiscordPicture| match s {
+            DiscordPicture::Cover => "Album cover",
+            DiscordPicture::AppIcon => "coda's icon",
+        };
+        kit::row(ui, &p, "Picture", None, true, true, 180.0, |ui| {
+            egui::ComboBox::from_id_salt("discord_picture").selected_text(picture(look.picture)).width(170.0).show_ui(ui, |ui| {
+                for s in [DiscordPicture::Cover, DiscordPicture::AppIcon] {
+                    fin::choice(ui, &mut look.picture, s, picture(s));
+                }
+            });
+        });
+        let cover = look.picture == DiscordPicture::Cover;
+        kit::switch_row(
+            ui,
+            &p,
+            "Play and pause sign on the cover",
+            Some("Shows the pictures named \"playing\" and \"paused\" in the application's Art Assets"),
+            &mut look.badge,
+            true,
+            cover,
+        );
+        kit::switch_row(
+            ui,
+            &p,
+            "\"Open on Spotify\" button",
+            Some("A link to the song for others. Nothing to join or listen along"),
+            &mut look.button,
+            true,
+            true,
+        );
+        if look != self.prefs.discord_look {
+            self.prefs.discord_look = look;
+            self.prefs_changed();
+            self.apply_platform_settings();
+        }
     }
 
     fn discord_setup(&mut self, ui: &mut Ui) {
@@ -1223,6 +1319,9 @@ mod tests {
             assert!(found(words, card(Item::WideScreens), Item::WideScreens), "{words}");
         }
         assert!(!found("ultrawide", card(Item::Theme), Item::Theme));
+        for words in ["discord progress bar", "hide from discord", "discord picture", "open on spotify button", "member list"] {
+            assert!(found(words, card(Item::Discord), Item::Discord), "{words}");
+        }
     }
 
     #[test]

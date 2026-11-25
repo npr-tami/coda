@@ -404,7 +404,7 @@ impl CodaApp {
             let aspect = if frame.x > 0.0 { (frame.y / frame.x).clamp(0.15, 1.2) } else { 0.36 };
             let (rect, resp) = ui.allocate_exact_size(vec2(w, (w * aspect).round()), Sense::click_and_drag());
             let painter = ui.painter_at(rect);
-            painter.rect_filled(rect, CornerRadius::same(8), p.main_bg);
+            painter.rect_filled(rect, CornerRadius::same(12), p.main_bg);
             match shown {
                 Some(shown) => {
                     let uv = crop_uv(shown.size, rect.size(), banner.zoom, pos2(banner.x, banner.y));
@@ -432,7 +432,7 @@ impl CodaApp {
                     painter.text(rect.center(), egui::Align2::CENTER_CENTER, "Loading the picture…", crate::ui::theme::regular(12.0), p.text_weak);
                 }
             }
-            painter.rect_stroke(rect, CornerRadius::same(8), Stroke::new(1.0, p.border), StrokeKind::Inside);
+            painter.rect_stroke(rect, CornerRadius::same(12), Stroke::new(1.0, p.border), StrokeKind::Inside);
             let cursor = if resp.dragged() { CursorIcon::Grabbing } else { CursorIcon::Grab };
             resp.on_hover_cursor(cursor);
             // Zoom: the name, a line, how far in, and RESET.

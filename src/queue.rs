@@ -665,6 +665,62 @@ impl PlayQueue {
             .collect()
     }
 
+    /// Plays in `order` (places in the songs, e.g. a sorted page's), unshuffled: from `start` (a
+    /// place in the songs; an unplayable one: the next playable after it in `order`), else the first
+    /// song `advance` would play. Unplayable songs are left out, as in the list's own order.
+    pub fn use_order(&mut self, order: Vec<usize>, start: Option<usize>, rules: &ShuffleRules, history: &PlayHistory) {
+        let n = self.tracks.len();
+        let playable = |i: usize| i < n && self.tracks[i].playable;
+        // The start, or the first playable song after it in the order given.
+        let begin = start.and_then(|s| order.iter().position(|&i| i == s)).and_then(|k| order[k..].iter().copied().find(|&i| playable(i)));
+        let order: Vec<usize> = order.iter().copied().filter(|&i| playable(i)).collect();
+        let first = match begin {
+            Some(s) => order.iter().position(|&i| i == s),
+            None => order.iter().position(|&i| is_eligible(&self.tracks[i], rules, history)),
+        };
+        self.shuffled = false;
+        self.orphan = None;
+        match first {
+            Some(p) => {
+                self.order = order;
+                self.pos = p;
+            }
+            None => {
+                self.order.clear();
+                self.pos = 0;
+            }
+        }
+    }
+
+    /// Moves the song at place `from` of Up next (as `upcoming_filtered` lists it: the queued songs
+    /// first, then the list's own) to place `to`, where it then is. The queued songs and the list's
+    /// songs each move among themselves: a move across goes to the nearest end of its own part.
+    /// The list's songs move in the play order itself, so the shuffle plays (and saves) that way.
+    /// False when nothing moved.
+    pub fn move_upcoming(&mut self, from: usize, to: usize, rules: &ShuffleRules, history: &PlayHistory) -> bool {
+        let q = self.queued.len();
+        if from < q {
+            let to = to.min(q - 1);
+            if from == to {
+                return false;
+            }
+            let t = self.queued.remove(from);
+            self.queued.insert(to, t);
+            return true;
+        }
+        let start = self.scan_start().min(self.order.len());
+        let start = if self.interlude.is_some() { (self.pos + 1).min(self.order.len()) } else { start };
+        // Where each listed song is in the play order (the skipped ones aren't listed).
+        let places: Vec<usize> = (start..self.order.len()).filter(|&k| is_eligible(&self.tracks[self.order[k]], rules, history)).collect();
+        let (Some(&a), Some(&b)) = (places.get(from - q), places.get(to.max(q) - q).or(places.last())) else { return false };
+        if a == b {
+            return false;
+        }
+        let i = self.order.remove(a);
+        self.order.insert(b, i);
+        true
+    }
+
     pub fn save(&self, position_ms: u32) -> SavedQueue {
         SavedQueue {
             source: self.source.clone(),
@@ -1685,6 +1741,69 @@ mod tests {
         let mut blocked = history.clone();
         blocked.blocked.insert(tracks[1].uri.clone());
         assert_eq!(q.advance(RepeatMode::One, &block_rules, &blocked).unwrap().uri, tracks[2].uri);
+    }
+
+    #[test]
+    fn a_sorted_list_plays_in_the_order_shown() {
+        let mut tracks: Vec<TrackInfo> = (0..5).map(|i| track(i, "a")).collect();
+        tracks[3].playable = false;
+        let tracks = Arc::new(tracks);
+        let rules = rules_off();
+        let history = PlayHistory::default();
+        let shown = vec![4, 3, 2, 1, 0];
+        let names = |q: &PlayQueue| std::iter::once(q.current().unwrap().name.clone()).chain(q.upcoming(9).iter().map(|t| t.name.clone())).collect::<Vec<_>>();
+        // From the first shown.
+        let mut q = PlayQueue::new_seeded(src(), tracks.clone(), None, false, &rules, &history, 1);
+        q.use_order(shown.clone(), None, &rules, &history);
+        assert_eq!(names(&q), ["Track 4", "Track 2", "Track 1", "Track 0"]);
+        assert!(!q.is_shuffled());
+        // From a song picked; an unplayable one starts at the next playable shown.
+        let mut q = PlayQueue::new_seeded(src(), tracks.clone(), Some(2), false, &rules, &history, 1);
+        q.use_order(shown.clone(), Some(2), &rules, &history);
+        assert_eq!(names(&q), ["Track 2", "Track 1", "Track 0"]);
+        q.use_order(shown, Some(3), &rules, &history);
+        assert_eq!(q.current().unwrap().name, "Track 2");
+    }
+
+    #[test]
+    fn a_song_moved_in_up_next_plays_there_and_is_saved_there() {
+        let tracks = distinct_tracks(6);
+        let rules = rules_off();
+        let history = PlayHistory::default();
+        let names = |q: &PlayQueue| q.upcoming_filtered(99, &rules, &history).iter().map(|t| t.name.clone()).collect::<Vec<_>>();
+        let mut q = PlayQueue::new_seeded(src(), tracks.clone(), Some(0), false, &rules, &history, 1);
+        assert_eq!(names(&q), ["Track 1", "Track 2", "Track 3", "Track 4", "Track 5"]);
+        // Down: Track 1 ends where Track 4 was.
+        assert!(q.move_upcoming(0, 3, &rules, &history));
+        assert_eq!(names(&q), ["Track 2", "Track 3", "Track 4", "Track 1", "Track 5"]);
+        // Up, to the top.
+        assert!(q.move_upcoming(4, 0, &rules, &history));
+        assert_eq!(names(&q), ["Track 5", "Track 2", "Track 3", "Track 4", "Track 1"]);
+        assert!(!q.move_upcoming(2, 2, &rules, &history));
+        assert!(!q.move_upcoming(9, 0, &rules, &history));
+        // It plays in that order, and the saved order has it.
+        assert_eq!(q.advance(RepeatMode::Off, &rules, &history).unwrap().name, "Track 5");
+        assert_eq!(q.save(0).order[1], tracks[5].uri);
+
+        // Queued songs move among themselves; a list song dropped among them goes to the list's top.
+        q.add_queued(track(10, "x"), false);
+        q.add_queued(track(11, "y"), false);
+        assert!(q.move_upcoming(1, 0, &rules, &history));
+        assert_eq!(names(&q)[..3], ["Track 11", "Track 10", "Track 2"]);
+        assert!(q.move_upcoming(4, 0, &rules, &history));
+        assert_eq!(names(&q)[..4], ["Track 11", "Track 10", "Track 4", "Track 2"]);
+        assert!(q.move_upcoming(0, 5, &rules, &history));
+        assert_eq!(names(&q)[..3], ["Track 10", "Track 11", "Track 4"]);
+
+        // Blocked songs that are skipped aren't listed: places count the listed songs only.
+        let block = ShuffleRules { skip_blocked: true, ..rules_off() };
+        let mut blocked = history.clone();
+        blocked.blocked.insert(tracks[3].uri.clone());
+        let mut q = PlayQueue::new_seeded(src(), tracks.clone(), Some(0), false, &block, &blocked, 1);
+        let listed = |q: &PlayQueue| q.upcoming_filtered(99, &block, &blocked).iter().map(|t| t.name.clone()).collect::<Vec<_>>();
+        assert_eq!(listed(&q), ["Track 1", "Track 2", "Track 4", "Track 5"]);
+        assert!(q.move_upcoming(3, 2, &block, &blocked));
+        assert_eq!(listed(&q), ["Track 1", "Track 2", "Track 5", "Track 4"]);
     }
 
     #[test]

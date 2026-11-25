@@ -16,7 +16,7 @@
 //! | Profile / owner names | `SpClient::get_user_profile(user, Some(0), Some(0))` → `/user-profile-view/v3/profile/{user}` | JSON `{name, image_url}` |
 //! | Liked Songs (read) | `SpClient::request(POST, "/collection/v2/delta", …)` with the last sync token, else `POST /collection/v2/paging` (300 a page); fallback `SpClient::get_context("spotify:user:{user}:collection")` + `SpClient::get_next_page(url)` | collection2v2 protobuf (hand-coded in `wire.rs`); `context::Context` (protobuf parsed by librespot) / JSON pages |
 //! | Liked Songs (write) | `SpClient::request(POST, "/collection/v2/write", …)`, sent by the like queue (`likes.rs`) | collection2v2 `WriteRequest`, set `"collection"` |
-//! | Market for playability | `Session::country()`, `Session::get_user_attribute("catalogue")`, `Session::filter_explicit_content()` | same rules as librespot's player (`AudioItem::get_file`) |
+//! | Playability | the details' status | greyed out only when Spotify says the track doesn't exist (404); everything else is tried when reached |
 //!
 //! `librespot_metadata::Playlist::get` / `Track::get` are not used: their conversions fail the
 //! whole playlist on a single odd item (local files, unusual dates), and `Track::get` is one
@@ -60,7 +60,6 @@ use crate::model::{PlaylistSummary, Source, TrackInfo, UserProfile};
 use crate::webapi::WebApi;
 
 use cache::CachedList;
-use convert::Market;
 pub use editing::Added;
 use fetch::LikedSet;
 
@@ -196,6 +195,9 @@ fn is_network(err: &CoreError, session: &Session) -> bool {
 fn normalized(uri: &str) -> String {
     convert::normalize_playlist_uri(uri).unwrap_or_else(|| uri.to_owned())
 }
+
+/// How many of an owner's public playlists their profile is asked for (to find one's likes).
+const PROFILE_PLAYLISTS: u32 = 200;
 
 struct Draft {
     summary: PlaylistSummary,
@@ -891,6 +893,66 @@ impl Library {
         lock(&self.inner.browse_info).get(source).cloned()
     }
 
+    /// A playlist's header as Spotify has it now (name, owner by their display name, picture,
+    /// songs), and how many people saved it: through the Web API when it is connected, else from
+    /// the owner's public profile (a private playlist has no count there).
+    pub async fn playlist_header_details(&self, uri: &str) -> Result<(PlaylistSummary, Option<u32>)> {
+        let session = self.session();
+        let me = require_username(&session)?;
+        let id = convert::playlist_id(uri).ok_or_else(|| anyhow!("That isn't a Spotify playlist."))?;
+        let header = fetch::playlist_header(&session, &id).await.map_err(|e| friendly("Couldn't read the playlist.", e, &session))?;
+        let Draft { mut summary, owner } = draft_from_list(&normalized(uri), &header, &me);
+        if !owner.is_empty() {
+            summary.owner_name = self.owner_name(&session, &owner).await;
+        }
+        let likes = self.playlist_likes(&session, &summary.uri, &owner).await;
+        Ok((summary, likes))
+    }
+
+    /// An owner's display name: remembered, else from their profile (their username if it can't
+    /// be had).
+    async fn owner_name(&self, session: &Session, owner: &str) -> String {
+        if owner == "spotify" {
+            return "Spotify".to_owned();
+        }
+        if let Some(name) = lock(&self.inner.state).owners.get(owner) {
+            return name.clone();
+        }
+        match fetch::user_profile(session, owner).await {
+            Ok(fetch::ProfileInfo { name: Some(name), .. }) => {
+                lock(&self.inner.state).owners.insert(owner.to_owned(), name.clone());
+                name
+            }
+            _ => owner.to_owned(),
+        }
+    }
+
+    /// How many people saved a playlist (`None`: unknown).
+    async fn playlist_likes(&self, session: &Session, uri: &str, owner: &str) -> Option<u32> {
+        if let Some(api) = self.webapi() {
+            match api.playlist_followers(uri).await {
+                Ok(Some(n)) => return Some(n),
+                Ok(None) => {}
+                Err(e) => log::debug!("playlist likes through the Web API: {e:#}"),
+            }
+        }
+        Self::likes_from_profile(session, uri, owner).await
+    }
+
+    /// How many people saved a playlist, from its owner's public profile (the route without the
+    /// Web API).
+    async fn likes_from_profile(session: &Session, uri: &str, owner: &str) -> Option<u32> {
+        if owner.is_empty() || owner == "spotify" {
+            return None;
+        }
+        let bytes = fetch::retry("user profile", || async move { session.spclient().get_user_profile(owner, Some(PROFILE_PLAYLISTS), Some(0)).await })
+            .await
+            .map_err(|e| log::debug!("playlist likes from the owner's profile: {e}"))
+            .ok()?;
+        let value: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+        profiles::playlist_likes(&value, uri)
+    }
+
     async fn album_tracks(&self, source: &Source, uri: &str, force: bool, progress: Progress<'_>) -> Result<Arc<Vec<TrackInfo>>> {
         use librespot_metadata::{Album, Metadata};
         let session = self.session();
@@ -1337,7 +1399,8 @@ fn reusable(cached: Option<&CachedList>) -> HashMap<&str, &TrackInfo> {
         .map(|c| {
             c.tracks
                 .iter()
-                .filter(|t| t.playable && !t.is_local)
+                // A track whose details didn't come (no length) is looked up again.
+                .filter(|t| t.playable && !t.is_local && t.duration_ms > 0)
                 .map(|t| (t.uri.as_str(), t))
                 .collect()
         })
@@ -1388,8 +1451,7 @@ async fn build_tracks(
     progress(loaded, Some(total));
     if !need.is_empty() {
         log::info!("fetching details for {} of {total} items ({} reused)", need.len(), known.len());
-        let market = Market::from_session(session);
-        let fetched = fetch::hydrate(session, need, &market, |done| {
+        let fetched = fetch::hydrate(session, need, |done| {
             loaded += done.iter().map(|u| occurrences.get(u.as_str()).copied().unwrap_or(0)).sum::<usize>();
             progress(loaded.min(total), Some(total));
         })

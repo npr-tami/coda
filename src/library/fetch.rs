@@ -17,7 +17,7 @@ use protobuf::{EnumOrUnknown, Message};
 use reqwest::Method;
 use reqwest::header::{ACCEPT, CONTENT_TYPE, HeaderMap, HeaderValue};
 
-use super::convert::{self, Market};
+use super::convert;
 use super::wire;
 use crate::model::TrackInfo;
 
@@ -419,12 +419,15 @@ enum Parsed {
 
 struct BatchOutcome {
     found: Vec<TrackInfo>,
+    /// Spotify said these don't exist (404).
+    gone: Vec<String>,
+    /// No details came for these (busy, rate limited, left out): asked again.
     missing: Vec<String>,
 }
 
 /// One `SpClient::get_extended_metadata` call (`POST /extended-metadata/v0/extended-metadata`)
 /// for TRACK_V4 / EPISODE_V4 extensions.
-async fn metadata_batch(session: &Session, uris: &[String], market: &Market) -> Result<BatchOutcome, CoreError> {
+async fn metadata_batch(session: &Session, uris: &[String]) -> Result<BatchOutcome, CoreError> {
     let request = metadata_request(uris);
     let response = retry("track details", || {
         let request = request.clone();
@@ -435,9 +438,14 @@ async fn metadata_batch(session: &Session, uris: &[String], market: &Market) -> 
 
     let wanted: HashSet<&str> = uris.iter().map(String::as_str).collect();
     let mut parsed: Vec<(String, Parsed)> = Vec::with_capacity(uris.len());
+    let mut gone: HashSet<String> = HashSet::new();
     for array in &response.extended_metadata {
         for data in &array.extension_data {
             let status = data.header.as_ref().map(|h| h.status_code).unwrap_or(0);
+            if status == 404 && wanted.contains(data.entity_uri.as_str()) {
+                gone.insert(data.entity_uri.clone());
+                continue;
+            }
             let Some(any) = data.extension_data.as_ref() else { continue };
             if any.value.is_empty() || !(status == 0 || (200..300).contains(&status)) {
                 continue;
@@ -460,33 +468,23 @@ async fn metadata_batch(session: &Session, uris: &[String], market: &Market) -> 
     }
     drop(response);
 
-    // If not a single item carries an audio file list, the server format changed: don't let
-    // that mark everything unplayable (the player still skips what it really can't play).
-    let any_audio = parsed.iter().any(|(_, p)| match p {
-        Parsed::Track(t) => !t.file.is_empty() || !t.alternative.is_empty(),
-        Parsed::Episode(e) => !e.audio.is_empty(),
-    });
-    let respect_files = any_audio || parsed.len() < 3;
-    if !respect_files {
-        log::warn!("track metadata came without audio file lists; not using them for playability");
-    }
-
     let mut found = Vec::with_capacity(parsed.len());
     let mut got: HashSet<String> = HashSet::with_capacity(parsed.len());
     for (uri, p) in parsed {
         let info = match &p {
-            Parsed::Track(t) => convert::track_info(&uri, t, market, respect_files),
-            Parsed::Episode(e) => convert::episode_info(&uri, e, market, respect_files),
+            Parsed::Track(t) => convert::track_info(&uri, t),
+            Parsed::Episode(e) => convert::episode_info(&uri, e),
         };
         got.insert(uri);
         found.push(info);
     }
-    let missing = uris.iter().filter(|u| !got.contains(u.as_str())).cloned().collect();
-    Ok(BatchOutcome { found, missing })
+    gone.retain(|u| !got.contains(u));
+    let missing = uris.iter().filter(|u| !got.contains(u.as_str()) && !gone.contains(u.as_str())).cloned().collect();
+    Ok(BatchOutcome { found, gone: gone.into_iter().collect(), missing })
 }
 
-async fn run_batch(session: &Session, batch: Vec<String>, market: &Market) -> (Vec<String>, Result<BatchOutcome, CoreError>) {
-    let result = metadata_batch(session, &batch, market).await;
+async fn run_batch(session: &Session, batch: Vec<String>) -> (Vec<String>, Result<BatchOutcome, CoreError>) {
+    let result = metadata_batch(session, &batch).await;
     (batch, result)
 }
 
@@ -500,7 +498,6 @@ static BATCH_LIMIT: AtomicUsize = AtomicUsize::new(METADATA_BATCH);
 pub async fn hydrate(
     session: &Session,
     uris: Vec<String>,
-    market: &Market,
     mut on_batch: impl FnMut(&[String]),
 ) -> Result<HashMap<String, TrackInfo>, CoreError> {
     let mut out: HashMap<String, TrackInfo> = HashMap::with_capacity(uris.len());
@@ -524,13 +521,19 @@ pub async fn hydrate(
                     let rest = batch.split_off(limit);
                     queue.push_front(rest);
                 }
-                in_flight.push(run_batch(session, batch, market));
+                in_flight.push(run_batch(session, batch));
             }
             let Some((batch, result)) = in_flight.next().await else { break };
             match result {
                 Ok(outcome) => {
                     for info in outcome.found {
                         out.insert(info.uri.clone(), info);
+                    }
+                    if !outcome.gone.is_empty() {
+                        log::info!("track details: Spotify says {} of {} don't exist", outcome.gone.len(), batch.len());
+                    }
+                    for uri in outcome.gone {
+                        out.insert(uri.clone(), convert::unavailable_info(&uri));
                     }
                     // Only report finished items; missing ones get another pass.
                     if outcome.missing.is_empty() {
@@ -570,10 +573,12 @@ pub async fn hydrate(
     }
 
     if !pending.is_empty() {
-        log::warn!("{} items have no metadata; marking them unavailable", pending.len());
+        // Not greyed out: no answer isn't "doesn't exist". Tried when reached, looked up again
+        // the next time the list is read.
+        log::warn!("{} items have no metadata yet; kept playable", pending.len());
         on_batch(&pending);
         for uri in pending {
-            out.insert(uri.clone(), convert::unavailable_info(&uri));
+            out.insert(uri.clone(), convert::unknown_info(&uri));
         }
     }
     Ok(out)

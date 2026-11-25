@@ -47,13 +47,13 @@ enum Part {
     /// "Sharing your music" with the sharing switch, the summary and MANAGE LINKS (Card);
     /// `open`: the links show in it.
     Card { open: bool },
-    /// "YOUR LINKS" with the sharing switch (List).
+    /// "Your links" with the sharing switch (List).
     LinksHead,
-    /// "SHARING" with the switch, and who hears what (Switch's Your listeners).
+    /// "Sharing" with the switch, and who hears what (Switch's Your listeners).
     SharingHead,
     /// The links' rows and New link.
     Links,
-    /// "FRIENDS".
+    /// "Friends".
     FriendsHead,
     /// The people to listen along with.
     Friends,
@@ -159,9 +159,9 @@ impl CodaApp {
             for &part in &parts {
                 y = match part {
                     Part::Card { open } => self.sharing_card(ui, left, width, y, open),
-                    Part::LinksHead => self.friends_head(ui, left, width, y, "YOUR LINKS", Some("Sharing")),
+                    Part::LinksHead => self.friends_head(ui, left, width, y, "Your links", Some("Sharing")),
                     Part::SharingHead => {
-                        let y = self.friends_head(ui, left, width, y, "SHARING", Some(if self.listen_share { "On" } else { "Off" }));
+                        let y = self.friends_head(ui, left, width, y, "Sharing", Some(if self.listen_share { "On" } else { "Off" }));
                         let note = "Friends with a link hear what you play. Only you see their names.";
                         let g = ui.painter().layout(note.to_owned(), regular(11.5), self.palette.text_weak, width - 16.0);
                         let gh = g.size().y;
@@ -169,7 +169,7 @@ impl CodaApp {
                         y + 4.0 + gh + 8.0
                     }
                     Part::Links => self.link_rows(ui, left, width, y),
-                    Part::FriendsHead => self.friends_head(ui, left, width, y + 4.0, "FRIENDS", None),
+                    Part::FriendsHead => self.friends_head(ui, left, width, y + 4.0, "Friends", None),
                     Part::Friends => self.friend_rows(ui, left, width, y),
                     Part::Sides | Part::Join => y,
                 };
@@ -201,7 +201,7 @@ impl CodaApp {
         ui.painter().galley(pos2(inner_l, sy), summary, p.text_weak);
         // MANAGE LINKS ▾ (▴ while open).
         let my = sy + sh + 10.0;
-        let word = fin::spaced(ui, "MANAGE LINKS", bold(11.0), p.accent_ink, 0.66);
+        let word = fin::spaced(ui, "Manage links", bold(12.0), p.accent_ink, 0.0);
         let (ww, wh) = (word.size().x, word.size().y);
         let hit = Rect::from_min_size(pos2(inner_l, my), vec2(ww + 4.0 + 12.0, wh)).expand(4.0);
         let tip = if open { "Hide your links" } else { "Show your links" };
@@ -221,13 +221,13 @@ impl CodaApp {
         card.bottom()
     }
 
-    /// A section's heading (`.sec`): `title` in small capitals, and with a `label` ("Sharing",
+    /// A section's heading (`.sec`): `title` as written, 12 px semibold, and with a `label` ("Sharing",
     /// "On") the sharing switch after it on the right. Returns its bottom.
     fn friends_head(&mut self, ui: &Ui, left: f32, width: f32, y: f32, title: &str, label: Option<&str>) -> f32 {
         let p = self.palette;
-        let g = fin::spaced(ui, title, bold(10.5), p.text_weak, 0.75);
+        let g = fin::spaced(ui, title, bold(12.0), p.text, 0.0);
         let cy = y + 12.0 + g.size().y / 2.0;
-        ui.painter().galley(pos2(left + 8.0, cy - g.size().y / 2.0), g, p.text_weak);
+        ui.painter().galley(pos2(left + 8.0, cy - g.size().y / 2.0), g, p.text);
         if let Some(label) = label {
             let sw = Rect::from_min_size(pos2(left + width - 8.0 - SWITCH.x, cy - SWITCH.y / 2.0), SWITCH);
             self.share_switch(ui, sw);
@@ -241,20 +241,22 @@ impl CodaApp {
     fn sides_switch(&mut self, ui: &Ui, strip: Rect) {
         let p = self.palette;
         let seg = Rect::from_min_max(pos2(strip.left() + 8.0, strip.top() + 12.0), pos2(strip.right() - 8.0, strip.bottom() - 4.0));
-        ui.painter().rect_filled(seg, CornerRadius::same(8), p.hover_bg);
+        let round = CornerRadius::same((seg.height() / 2.0) as u8);
+        ui.painter().rect_filled(seg, round, p.widget_bg);
         let half = (seg.width() - 6.0) / 2.0;
         let part = |i: usize| Rect::from_min_size(pos2(seg.left() + 3.0 + i as f32 * half, seg.top() + 3.0), vec2(half, seg.height() - 6.0));
         // The raised half slides to the side picked.
         let chosen = usize::from(self.listeners_shown);
         motion::marker(ui.ctx(), Id::new("friends-side-pill"), seg.min, Some((chosen, part(chosen))), motion::TAB, |r, a| {
-            ui.painter().rect_filled(r, CornerRadius::same(6), (if p.dark { p.widget_hover_bg } else { p.raised_bg }).gamma_multiply(a));
+            ui.painter().rect_filled(r, CornerRadius::same((r.height() / 2.0) as u8), p.chip_on_bg().gamma_multiply(a));
         });
         for (i, (word, listeners)) in [("Friends", false), ("Your listeners", true)].into_iter().enumerate() {
             let r = part(i);
             let on = self.listeners_shown == listeners;
             let resp = ui.interact(r, Id::new(("friends-side", i)), Sense::click()).on_hover_cursor(CursorIcon::PointingHand);
-            let color = motion::color(ui.ctx(), resp.id, fin::tab_ink(&p, on, resp.hovered()), motion::HOVER);
-            let g = one_line(ui, word, if on { bold(12.0) } else { medium(12.0) }, color, half - 8.0, false);
+            let ink = if on { p.chip_on_ink() } else { fin::tab_ink(&p, false, resp.hovered()) };
+            let color = motion::color(ui.ctx(), resp.id, ink, motion::HOVER);
+            let g = one_line(ui, word, medium(12.0), color, half - 8.0, false);
             ui.painter().galley(r.center() - g.size() / 2.0, g, color);
             if resp.clicked() {
                 self.listeners_shown = listeners;
@@ -293,11 +295,9 @@ impl CodaApp {
         self.frame.panel_tab = Tab::Friends;
         let w = self.ctx.input_for(ViewportId::ROOT, |i| i.content_rect().width());
         match frame::mode_of(w) {
-            Mode::Wide => self.prefs.show_rules_panel = true,
-            Mode::Medium => self.prefs.panel_medium = true,
             Mode::Narrow => self.middle_tab = MiddleTab::Playing,
+            _ => self.open_side_panel(w),
         }
-        self.prefs_changed();
         self.ctx.request_repaint_of(ViewportId::ROOT);
     }
 
@@ -436,7 +436,7 @@ impl CodaApp {
         ui.painter().hline(rect.x_range(), rect.top() + 0.5, Stroke::new(1.0, p.field_border));
         let left = rect.left() + 16.0;
         let width = rect.width() - 32.0;
-        let head = fin::spaced(ui, "JOIN WITH A LINK", bold(10.5), p.text_weak, 0.95);
+        let head = fin::spaced(ui, "Join with a link", bold(12.0), p.text, 0.0);
         let hh = head.size().y;
         ui.painter().galley(pos2(left, rect.top() + 12.0), head, p.text_weak);
         let row_y = rect.top() + 12.0 + hh + 8.0;

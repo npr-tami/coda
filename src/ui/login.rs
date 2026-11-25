@@ -132,12 +132,12 @@ impl CodaApp {
     }
 }
 
-/// The login button: the accent, 40 tall, round 8, 12 px semibold capitals spaced out.
+/// The login button: the accent, a 40 tall pill, 13 px semibold as written.
 fn login_button(ui: &mut Ui, p: &super::theme::Palette, text: &str) -> egui::Response {
-    let g = fin::spaced(ui, &text.to_uppercase(), bold(12.0), p.on_accent, 0.7);
+    let g = fin::spaced(ui, text, bold(13.0), p.on_accent, 0.0);
     let (rect, resp) = ui.allocate_exact_size(vec2(g.size().x + 56.0, 40.0), Sense::click());
     let fill = if resp.hovered() { fin::brighten(p.accent, 1.07) } else { p.accent };
-    ui.painter().rect_filled(rect, CornerRadius::same(8), fill);
+    ui.painter().rect_filled(rect, CornerRadius::same(20), fill);
     ui.painter().galley(rect.center() - g.size() / 2.0, g, p.on_accent);
     resp.on_hover_cursor(CursorIcon::PointingHand)
 }

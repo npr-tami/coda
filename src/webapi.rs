@@ -32,7 +32,7 @@ use self::http::ReqBody;
 use self::types::{ApiPage, ApiSavedTrack, ApiUser};
 
 pub use self::auth::{SCOPES, cancel_pending_login};
-pub use self::cover::{MAX_COVER_BASE64_LEN, prepare_cover_jpeg};
+pub use self::cover::{CoverCrop, MAX_COVER_BASE64_LEN, cover_preview, crop_cover, load_cover_picture, prepare_cover_jpeg};
 
 pub const REDIRECT_URI: &str = "http://127.0.0.1:8899/callback";
 
@@ -391,12 +391,28 @@ impl WebApi {
         Ok(())
     }
 
+    /// How many people saved a playlist (`None`: Spotify didn't say).
+    pub async fn playlist_followers(&self, playlist_uri: &str) -> Result<Option<u32>> {
+        let id = parse_playlist_id(playlist_uri)?;
+        let value: serde_json::Value =
+            self.get_json(&format!("/playlists/{id}"), &[("fields", "followers.total")], "read the playlist").await?;
+        Ok(value["followers"]["total"].as_u64().map(|n| n.min(u64::from(u32::MAX)) as u32))
+    }
+
     /// Removes a playlist from the user's library (unfollows it; for a playlist the user owns this
     /// is what Spotify calls deleting).
     pub async fn remove_playlist(&self, playlist_uri: &str) -> Result<()> {
         let id = parse_playlist_id(playlist_uri)?;
         let uri = format!("spotify:playlist:{id}");
         self.call(Method::DELETE, "/me/library", &[("uris", uri.as_str())], &ReqBody::Empty, "remove the playlist").await?;
+        Ok(())
+    }
+
+    /// Someone else's playlist into the library (following it); undone by `remove_playlist`.
+    pub async fn add_playlist(&self, playlist_uri: &str) -> Result<()> {
+        let id = parse_playlist_id(playlist_uri)?;
+        let uri = format!("spotify:playlist:{id}");
+        self.call(Method::PUT, "/me/library", &[("uris", uri.as_str())], &ReqBody::Empty, "add the playlist").await?;
         Ok(())
     }
 

@@ -11,7 +11,7 @@ use anyhow::Result;
 use super::jobs::Job;
 use super::{Controller, user_error};
 use crate::library::{Added, Library};
-use crate::model::{AlreadyIn, Event, PlayStats, Source, TrackInfo};
+use crate::model::{AlreadyIn, Event, PlayStats, PlaylistDetails, Source, TrackInfo};
 
 /// How long a removed playlist stays hidden while Spotify's list still shows it.
 const REMOVED_HIDE_FOR: Duration = Duration::from_secs(30 * 60);
@@ -34,6 +34,10 @@ pub(super) enum BrowseDone {
     Created { uri: String, name: String },
     /// A playlist was removed from the library.
     Removed { uri: String },
+    /// Someone else's playlist was added to the library.
+    Added { uri: String },
+    /// A listen-along link playlist no link here used was deleted (the log never names it).
+    LinkPlaylistRemoved { uri: String },
     /// Spotify described the most played song (for Settings > About).
     TopSong { uri: String, track: TrackInfo },
 }
@@ -286,6 +290,24 @@ impl Controller {
         playing.chain(shown).find(|t| t.uri == uri).or(found_before).cloned().or_else(|| self.library.as_ref()?.cached_track(uri))
     }
 
+    /// A song's details for a pasted song link: from what is loaded, else looked up (the same
+    /// details request a list's songs use).
+    pub(super) fn cmd_find_track(&mut self, uri: String) {
+        if let Some(track) = self.known_track(&uri) {
+            self.ui.send(Event::TrackFound(Box::new(track)));
+            return;
+        }
+        let Some(library) = self.library.clone() else { return };
+        let ui = self.ui.clone();
+        tokio::spawn(async move {
+            match library.recheck(&uri).await {
+                Ok(track) if !track.artists.is_empty() => ui.send(Event::TrackFound(Box::new(track))),
+                Ok(_) => ui.send(Event::Error("Spotify doesn't know that song.".to_owned())),
+                Err(e) => ui.send(Event::Error(user_error("Couldn't find that song.", &e))),
+            }
+        });
+    }
+
     /// Fetches a song's Canvas from Spotify: a video is downloaded into the cache (kept there for the
     /// next time), a picture only named for the UI to load.
     pub(super) fn cmd_canvas(&mut self, uri: String) {
@@ -484,6 +506,65 @@ impl Controller {
         });
     }
 
+    /// A song dragged to another place in one of the user's playlists (shown moved already).
+    pub(super) fn cmd_move_playlist_song(&mut self, playlist_uri: String, before: Arc<Vec<TrackInfo>>, from: usize, to: usize) {
+        let Some(library) = self.library.clone() else { return };
+        let ui = self.ui.clone();
+        tokio::spawn(async move {
+            match library.move_song(&playlist_uri, &before, from, to).await {
+                Ok(()) => log::info!("moved a song in {playlist_uri} from {from} to {to}"),
+                Err(e) => {
+                    log::warn!("moving a song in {playlist_uri}: {e:#}");
+                    ui.send(Event::SourceLoaded { source: Source::Playlist(playlist_uri), tracks: before });
+                    ui.send(Event::Error(user_error("Couldn't move the song.", &e)));
+                }
+            }
+        });
+    }
+
+    /// Adds someone else's playlist to the library (follows it).
+    pub(super) fn cmd_add_playlist(&mut self, uri: String) {
+        let Some(library) = self.library.clone() else {
+            self.ui.send(Event::Error("Log in to Spotify first.".into()));
+            return;
+        };
+        let (epoch, tx) = (self.epoch, self.jobs.clone());
+        tokio::spawn(async move {
+            let result = library.add_playlist(&uri).await.map(|()| BrowseDone::Added { uri });
+            let _ = tx.send(Job::Browse { epoch, result });
+        });
+    }
+
+    /// A playlist's header and likes, for its page.
+    pub(super) fn cmd_playlist_details(&mut self, uri: String) {
+        let Some(library) = self.library.clone() else { return };
+        let ui = self.ui.clone();
+        tokio::spawn(async move {
+            let (summary, likes) = match library.playlist_header_details(&uri).await {
+                Ok((summary, likes)) => (Some(summary), likes),
+                Err(e) => {
+                    log::debug!("a playlist's details couldn't be read: {e:#}");
+                    (None, None)
+                }
+            };
+            ui.send(Event::PlaylistDetails(PlaylistDetails { uri, summary, likes }));
+        });
+    }
+
+    /// Deletes a listen-along link playlist that no link here uses (made on another PC, or by an
+    /// older Coda).
+    pub(super) fn delete_unused_link_playlist(&mut self, uri: String) {
+        let Some(library) = self.library.clone() else {
+            self.ui.send(Event::Error("Log in to Spotify first.".into()));
+            return;
+        };
+        let (epoch, tx) = (self.epoch, self.jobs.clone());
+        tokio::spawn(async move {
+            let result = library.remove_channel(&uri).await.map(|()| BrowseDone::LinkPlaylistRemoved { uri });
+            let _ = tx.send(Job::Browse { epoch, result });
+        });
+    }
+
     /// Leaves out playlists removed a moment ago that Spotify's list still has; forgets the ones
     /// it no longer has (or that were removed long ago).
     pub(super) fn hide_removed_playlists(&mut self, playlists: &mut Vec<crate::model::PlaylistSummary>) {
@@ -565,6 +646,21 @@ impl Controller {
                 self.playlists.retain(|p| p.uri != uri);
                 self.ui.send(Event::PlaylistRemoved { uri });
                 self.ui.send(Event::Status("Removed from your library".into()));
+                self.request_library(true);
+            }
+            BrowseDone::Added { uri } => {
+                log::info!("added playlist {uri} to the library");
+                self.removed_playlists.remove(&uri);
+                self.ui.send(Event::Status("Added to your library".into()));
+                self.request_library(true);
+            }
+            BrowseDone::LinkPlaylistRemoved { uri } => {
+                log::info!("deleted a link's playlist no link here used");
+                self.removed_playlists.insert(uri.clone(), Instant::now());
+                self.playlists.retain(|p| p.uri != uri);
+                self.ui.send(Event::PlaylistRemoved { uri });
+                self.ui.send(Event::Status("Deleted the link's playlist".into()));
+                self.send_link_playlists();
                 self.request_library(true);
             }
             BrowseDone::TopSong { uri, track } => {

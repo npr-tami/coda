@@ -1,18 +1,20 @@
 //! Discord "Listening to" status over Discord's local IPC pipe, on its own thread.
 //!
-//! Only a plain activity is ever sent: song, artist, album art and a progress bar. No party,
-//! join/spectate secrets or buttons, so nobody can join or "listen along".
+//! Only a plain activity is ever sent: two lines about the song, a picture, a progress bar and,
+//! if the user asks for it, an "Open on Spotify" link button. No party,
+//! join/spectate secrets or instance, so nobody can join or "listen along".
 
 use std::collections::VecDeque;
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
-use discord_rich_presence::activity::{Activity, ActivityType, Assets, StatusDisplayType, Timestamps};
+use discord_rich_presence::activity::{Activity, ActivityType, Assets, Button, StatusDisplayType, Timestamps};
 use discord_rich_presence::{DiscordIpc, DiscordIpcClient};
 use serde_json::{Value, json};
 
 use super::state::{truncate_utf16, utf16_len};
+use crate::config::{DiscordLook, DiscordPaused, DiscordPicture, DiscordShows};
 
 /// Retry interval while Discord isn't running.
 const RETRY_INTERVAL: Duration = Duration::from_secs(15);
@@ -34,18 +36,96 @@ const IMAGE_URL_MAX: usize = 256;
 /// Frames to read while waiting for the reply to one command (skips unrelated events).
 const MAX_FRAMES_PER_REPLY: usize = 16;
 
-/// What to show; `None` clears the status.
+/// What to show; `None` clears the status. Built by [`presence_for`] with the settings applied.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Presence {
-    pub title: String,
-    pub artist: String,
-    pub album: String,
+    /// The two lines, already fitted to Discord's limits.
+    pub top: String,
+    pub bottom: Option<String>,
+    pub shows: DiscordShows,
+    /// The album cover (`None`: the application's own picture) and its hover text.
     pub cover: Option<String>,
-    /// Unix ms when the song started (adjusted for seeks).
-    pub start_ms: i64,
+    pub cover_text: Option<String>,
+    /// The small play/pause sign on the cover: `Some(true)` playing, `Some(false)` paused.
+    pub badge: Option<bool>,
+    /// Unix ms when the song started (adjusted for seeks); `None` shows no time at all.
+    pub start_ms: Option<i64>,
     /// Unix ms when it ends; `None` hides the progress bar.
     pub end_ms: Option<i64>,
+    /// "Open on Spotify": the song's web page.
+    pub link: Option<String>,
 }
+
+/// The song the status is about.
+pub struct Song<'a> {
+    pub uri: &'a str,
+    pub title: &'a str,
+    pub artist: &'a str,
+    pub album: &'a str,
+    /// The list it plays from ("" when unknown).
+    pub playlist: &'a str,
+    pub cover: Option<&'a str>,
+}
+
+/// The art asset keys of the small sign. They must be uploaded under these names in the Discord
+/// application's Rich Presence → Art Assets, or Discord shows no sign.
+pub const BADGE_PLAYING: &str = "playing";
+pub const BADGE_PAUSED: &str = "paused";
+/// The link button's words (Discord allows 32 characters).
+pub const BUTTON_LABEL: &str = "Open on Spotify";
+
+/// What Discord should show for `song`, with the user's `look`. `timing` is (start, end) in Unix
+/// ms; `playing` false means paused. `None`: show nothing (paused, with "clear when paused").
+pub fn presence_for(song: &Song, playing: bool, timing: (i64, Option<i64>), look: &DiscordLook) -> Option<Presence> {
+    if !playing && look.paused == DiscordPaused::Clear {
+        return None;
+    }
+    let top = discord_text(&fill_line(&look.top, song))
+        .or_else(|| discord_text(song.title))
+        .unwrap_or_else(|| "Unknown song".to_owned());
+    let mut bottom = discord_text(&fill_line(&look.bottom, song));
+    if !playing {
+        bottom = discord_text(&bottom.map_or_else(|| "Paused".to_owned(), |b| format!("Paused · {b}")));
+    }
+    let cover = match look.picture {
+        DiscordPicture::Cover => song.cover.filter(|url| url.starts_with("https://") && url.len() <= IMAGE_URL_MAX),
+        DiscordPicture::AppIcon => None,
+    };
+    let (start_ms, end_ms) = match (playing, look.progress) {
+        (true, true) => (Some(timing.0), timing.1.filter(|end| *end > timing.0)),
+        // Paused, or no progress bar: no time at all (a start alone shows a running clock).
+        _ => (None, None),
+    };
+    Some(Presence {
+        top,
+        bottom,
+        shows: look.shows,
+        cover: cover.map(str::to_owned),
+        cover_text: cover.and_then(|_| discord_text(song.album)),
+        badge: (look.badge && cover.is_some()).then_some(playing),
+        start_ms,
+        end_ms,
+        link: look.button.then(|| song.uri.strip_prefix("spotify:track:")).flatten().filter(|id| !id.is_empty())
+            .map(|id| format!("https://open.spotify.com/track/{id}")),
+    })
+}
+
+/// A line template with {title} {artist} {album} {playlist} filled in. When a part is empty, the
+/// separators left dangling at either end ("Song · ") go too.
+pub fn fill_line(template: &str, song: &Song) -> String {
+    let parts = [("{title}", song.title), ("{artist}", song.artist), ("{album}", song.album), ("{playlist}", song.playlist)];
+    let mut out = template.to_owned();
+    let mut gap = false;
+    for (key, value) in parts {
+        if out.contains(key) {
+            gap |= value.trim().is_empty();
+            out = out.replace(key, value.trim());
+        }
+    }
+    let out = out.trim();
+    if gap { out.trim_matches(|c: char| c.is_whitespace() || "·•-–—|,:/".contains(c)).to_owned() } else { out.to_owned() }
+}
+
 
 /// Connection state shown in Settings.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -109,32 +189,42 @@ pub fn discord_text(text: &str) -> Option<String> {
     Some(out)
 }
 
-/// The activity payload. Deliberately has no party, secrets or buttons.
+/// The activity payload. Deliberately has no party, secrets or join/spectate: at most one plain
+/// link button, and only when the user turned it on.
 pub fn activity_json(presence: &Presence) -> Value {
-    let title = discord_text(&presence.title).unwrap_or_else(|| "Unknown song".to_owned());
+    let shows = match presence.shows {
+        DiscordShows::App => StatusDisplayType::Name,
+        DiscordShows::Song => StatusDisplayType::Details,
+        DiscordShows::Artist => StatusDisplayType::State,
+    };
     let mut activity = Activity::new()
         .activity_type(ActivityType::Listening)
-        .status_display_type(StatusDisplayType::Details)
-        .details(title);
-    if let Some(artist) = discord_text(&presence.artist) {
-        activity = activity.state(artist);
+        .status_display_type(shows)
+        .details(presence.top.as_str());
+    if let Some(bottom) = &presence.bottom {
+        activity = activity.state(bottom.as_str());
     }
-    let cover = presence
-        .cover
-        .as_deref()
-        .filter(|url| url.starts_with("https://") && url.len() <= IMAGE_URL_MAX);
-    if let Some(cover) = cover {
-        let mut assets = Assets::new().large_image(cover.to_owned());
-        if let Some(album) = discord_text(&presence.album) {
-            assets = assets.large_text(album);
+    if let Some(cover) = &presence.cover {
+        let mut assets = Assets::new().large_image(cover.as_str());
+        if let Some(text) = &presence.cover_text {
+            assets = assets.large_text(text.as_str());
+        }
+        if let Some(playing) = presence.badge {
+            let (key, text) = if playing { (BADGE_PLAYING, "Playing") } else { (BADGE_PAUSED, "Paused") };
+            assets = assets.small_image(key).small_text(text);
         }
         activity = activity.assets(assets);
     }
-    let mut timestamps = Timestamps::new().start(presence.start_ms);
-    if let Some(end) = presence.end_ms.filter(|end| *end > presence.start_ms) {
-        timestamps = timestamps.end(end);
+    if let Some(start) = presence.start_ms {
+        let mut timestamps = Timestamps::new().start(start);
+        if let Some(end) = presence.end_ms {
+            timestamps = timestamps.end(end);
+        }
+        activity = activity.timestamps(timestamps);
     }
-    activity = activity.timestamps(timestamps);
+    if let Some(link) = &presence.link {
+        activity = activity.buttons(vec![Button::new(BUTTON_LABEL, link.as_str())]);
+    }
     serde_json::to_value(activity).unwrap_or(Value::Null)
 }
 
@@ -476,16 +566,21 @@ mod tests {
         assert_eq!(utf16_len(&discord_text(&"y".repeat(300)).unwrap()), TEXT_MAX);
     }
 
+    fn rick<'a>() -> Song<'a> {
+        Song {
+            uri: "spotify:track:4cOdK2wGLETKBW3PvgPWqT",
+            title: "Never Gonna Give You Up",
+            artist: "Rick Astley",
+            album: "Whenever You Need Somebody",
+            playlist: "Road trip",
+            cover: Some("https://i.scdn.co/image/abc"),
+        }
+    }
+
     #[test]
     fn activity_is_listening_with_progress_and_nothing_joinable() {
-        let presence = Presence {
-            title: "Never Gonna Give You Up".into(),
-            artist: "Rick Astley".into(),
-            album: "Whenever You Need Somebody".into(),
-            cover: Some("https://i.scdn.co/image/abc".into()),
-            start_ms: 1_000,
-            end_ms: Some(214_000),
-        };
+        // The default settings look exactly like the status always did.
+        let presence = presence_for(&rick(), true, (1_000, Some(214_000)), &DiscordLook::default()).unwrap();
         let v = activity_json(&presence);
         assert_eq!(v["type"], 2);
         assert_eq!(v["status_display_type"], 2);
@@ -493,17 +588,99 @@ mod tests {
         assert_eq!(v["state"], "Rick Astley");
         assert_eq!(v["assets"]["large_image"], "https://i.scdn.co/image/abc");
         assert_eq!(v["assets"]["large_text"], "Whenever You Need Somebody");
+        assert!(v["assets"].get("small_image").is_none());
         assert_eq!(v["timestamps"]["start"], 1_000);
         assert_eq!(v["timestamps"]["end"], 214_000);
         for forbidden in ["party", "secrets", "buttons", "instance"] {
             assert!(v.get(forbidden).is_none(), "{forbidden} must never be sent");
         }
+        // Paused: nothing, as before.
+        assert_eq!(presence_for(&rick(), false, (1_000, Some(214_000)), &DiscordLook::default()), None);
 
         // No cover, no artist, unknown length.
-        let bare = Presence { artist: String::new(), cover: None, end_ms: None, ..presence };
-        let v = activity_json(&bare);
+        let bare = Song { artist: "", cover: None, ..rick() };
+        let v = activity_json(&presence_for(&bare, true, (1_000, None), &DiscordLook::default()).unwrap());
         assert!(v.get("state").is_none() && v.get("assets").is_none());
         assert!(v["timestamps"].get("end").is_none());
+    }
+
+    #[test]
+    fn the_link_button_is_the_only_button_and_only_when_turned_on() {
+        let look = DiscordLook { button: true, ..DiscordLook::default() };
+        let v = activity_json(&presence_for(&rick(), true, (1_000, Some(214_000)), &look).unwrap());
+        let buttons = v["buttons"].as_array().unwrap();
+        assert_eq!(buttons.len(), 1);
+        assert_eq!(buttons[0]["label"], BUTTON_LABEL);
+        assert_eq!(buttons[0]["url"], "https://open.spotify.com/track/4cOdK2wGLETKBW3PvgPWqT");
+        assert!(utf16_len(BUTTON_LABEL) <= 32);
+        for forbidden in ["party", "secrets", "instance"] {
+            assert!(v.get(forbidden).is_none(), "{forbidden} must never be sent");
+        }
+        assert!(v.to_string().find("join").is_none() && v.to_string().find("spectate").is_none());
+        // A local file has no Spotify page: no button.
+        let local = Song { uri: "spotify:local:a:b:c:1", ..rick() };
+        assert!(activity_json(&presence_for(&local, true, (1_000, None), &look).unwrap()).get("buttons").is_none());
+    }
+
+    #[test]
+    fn the_status_follows_the_discord_settings() {
+        let look = DiscordLook {
+            top: "{title} · {album}".into(),
+            bottom: "{artist} on {playlist}".into(),
+            shows: DiscordShows::Artist,
+            paused: DiscordPaused::Keep,
+            progress: false,
+            picture: DiscordPicture::Cover,
+            badge: true,
+            button: false,
+        };
+        let v = activity_json(&presence_for(&rick(), true, (1_000, Some(214_000)), &look).unwrap());
+        assert_eq!(v["details"], "Never Gonna Give You Up · Whenever You Need Somebody");
+        assert_eq!(v["state"], "Rick Astley on Road trip");
+        assert_eq!(v["status_display_type"], 1);
+        assert!(v.get("timestamps").is_none(), "no progress bar");
+        assert_eq!(v["assets"]["small_image"], BADGE_PLAYING);
+
+        // Kept while paused: marked "Paused", no time, the pause sign.
+        let v = activity_json(&presence_for(&rick(), false, (1_000, Some(214_000)), &look).unwrap());
+        assert_eq!(v["state"], "Paused · Rick Astley on Road trip");
+        assert!(v.get("timestamps").is_none());
+        assert_eq!(v["assets"]["small_image"], BADGE_PAUSED);
+        let with_bar = DiscordLook { progress: true, ..look.clone() };
+        assert!(activity_json(&presence_for(&rick(), false, (1_000, Some(9_000)), &with_bar).unwrap()).get("timestamps").is_none());
+
+        // coda's picture: no cover, so no badge either; "Listening to coda" in the member list.
+        let icon = DiscordLook { picture: DiscordPicture::AppIcon, shows: DiscordShows::App, ..look.clone() };
+        let v = activity_json(&presence_for(&rick(), true, (1_000, None), &icon).unwrap());
+        assert!(v.get("assets").is_none());
+        assert_eq!(v["status_display_type"], 0);
+        let song = DiscordLook { shows: DiscordShows::Song, ..look };
+        assert_eq!(activity_json(&presence_for(&rick(), true, (1_000, None), &song).unwrap())["status_display_type"], 2);
+    }
+
+    #[test]
+    fn line_templates_fill_in_and_stay_within_discord_limits() {
+        let song = rick();
+        assert_eq!(fill_line("{title}", &song), "Never Gonna Give You Up");
+        assert_eq!(fill_line("{artist} – {album}", &song), "Rick Astley – Whenever You Need Somebody");
+        assert_eq!(fill_line("Now: {title}!", &song), "Now: Never Gonna Give You Up!");
+        // An empty part takes its dangling separator with it.
+        let loose = Song { playlist: "", album: " ", ..rick() };
+        assert_eq!(fill_line("{title} · {playlist}", &loose), "Never Gonna Give You Up");
+        assert_eq!(fill_line("{album} - {artist}", &loose), "Rick Astley");
+        // An empty top line falls back to the title; an empty bottom line is left out.
+        let look = DiscordLook { top: "{playlist}".into(), bottom: "  ".into(), ..DiscordLook::default() };
+        let p = presence_for(&loose, true, (0, None), &look).unwrap();
+        assert_eq!((p.top.as_str(), p.bottom), ("Never Gonna Give You Up", None));
+        // Too long is cut to 128; one letter is padded to 2.
+        let long = "x".repeat(400);
+        let look = DiscordLook { top: long.clone(), bottom: "y".into(), ..DiscordLook::default() };
+        let p = presence_for(&song, true, (0, None), &look).unwrap();
+        assert_eq!(utf16_len(&p.top), TEXT_MAX);
+        assert_eq!(utf16_len(p.bottom.as_deref().unwrap()), TEXT_MIN);
+        let paused = DiscordLook { top: long, bottom: "{album}".repeat(3), paused: DiscordPaused::Keep, ..DiscordLook::default() };
+        let p = presence_for(&song, false, (0, None), &paused).unwrap();
+        assert!(utf16_len(p.bottom.as_deref().unwrap()) <= TEXT_MAX && p.bottom.unwrap().starts_with("Paused · "));
     }
 
     #[test]
@@ -552,7 +729,7 @@ mod tests {
             if std::mem::take(&mut *self.fail_next_send.lock().unwrap()) {
                 return Err("pipe closed".to_owned());
             }
-            self.calls.lock().unwrap().push(Call::Send(presence.map(|p| p.title.clone())));
+            self.calls.lock().unwrap().push(Call::Send(presence.map(|p| p.top.trim_end_matches('\u{2800}').to_owned())));
             Ok(true)
         }
         fn close(&mut self) {
@@ -561,14 +738,8 @@ mod tests {
     }
 
     fn song(title: &str) -> Presence {
-        Presence {
-            title: title.to_owned(),
-            artist: "Artist".to_owned(),
-            album: "Album".to_owned(),
-            cover: None,
-            start_ms: 0,
-            end_ms: Some(1),
-        }
+        let song = Song { uri: "spotify:track:x", title, artist: "Artist", album: "Album", playlist: "", cover: None };
+        presence_for(&song, true, (0, Some(1)), &DiscordLook::default()).unwrap()
     }
 
     fn wait_for(calls: &Arc<Mutex<Vec<Call>>>, what: impl Fn(&[Call]) -> bool) -> Vec<Call> {

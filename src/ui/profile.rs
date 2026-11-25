@@ -144,14 +144,17 @@ impl CodaApp {
                 let (left, x1) = (col.left, col.right());
                 // The hero (`padding: 22px 24px 16px`): the round picture, PROFILE, the name, the
                 // details and the buttons, standing on the picture's foot.
-                let pic = Rect::from_min_size(pos2(left, top_y + 22.0), vec2(ps, ps));
+                // A small picture stands lower, so the words standing on its foot keep 22 above them (as
+                // on a list page's hero).
+                let rise = (ui.fonts_mut(|f| f.row_height(&medium(12.0))) + 4.0 + 31.5 + 6.0 + 19.0 + 14.0 + 28.0 + 2.0 - ps).max(0.0);
+                let pic = Rect::from_min_size(pos2(left, top_y + 22.0 + rise), vec2(ps, ps));
                 self.profile_picture(ui, pic, image.as_deref());
                 let x = pic.right() + 24.0;
                 let acts_top = pic.bottom() - 2.0 - 28.0;
                 let meta_top = acts_top - 14.0 - 19.0;
                 let title = ui.painter().layout_no_wrap(name.clone(), heavy(30.0), p.text_strong);
                 let title_top = meta_top - 6.0 - 31.5 - (title.size().y - 31.5) / 2.0;
-                let kind = fin::spaced(ui, "PROFILE", bold(10.5), p.text_weak, 1.05);
+                let kind = fin::spaced(ui, "Profile", medium(12.0), p.text_weak, 0.0);
                 let kind_top = meta_top - 6.0 - 31.5 - 4.0 - kind.size().y;
                 ui.painter().galley(pos2(x, kind_top), kind, p.text_weak);
                 ui.painter().galley(pos2(x, title_top), title, p.text_strong);
@@ -261,7 +264,7 @@ impl CodaApp {
         let ps = w.min(300.0);
         let pic = Rect::from_min_size(pos2(mid - ps / 2.0, y), vec2(ps, ps));
         self.profile_picture(ui, pic, image);
-        let kind = fin::spaced(ui, "PROFILE", bold(10.5), p.text_weak, 1.05);
+        let kind = fin::spaced(ui, "Profile", medium(12.0), p.text_weak, 0.0);
         let kind_top = pic.bottom() + 22.0;
         let kh = kind.size().y;
         ui.painter().galley(pos2(mid - kind.size().x / 2.0, kind_top), kind, p.text_weak);
@@ -406,7 +409,10 @@ impl CodaApp {
             };
             // What has just come fades in.
             let was = motion::content_in(ui, Id::new(("profile", user)));
-            let pic = Rect::from_min_size(pos2(left, top_y + 22.0), vec2(ps, ps));
+            // A small picture stands lower, so the words standing on its foot keep 22 above them (as
+            // on a list page's hero).
+            let rise = (ui.fonts_mut(|f| f.row_height(&medium(12.0))) + 4.0 + 31.5 + 6.0 + 19.0 + 14.0 + 28.0 + 2.0 - ps).max(0.0);
+            let pic = Rect::from_min_size(pos2(left, top_y + 22.0 + rise), vec2(ps, ps));
             if !self.images.paint(ui, page.image.as_deref(), pic, (ps / 2.0) as u8, p.widget_bg) {
                 ui.painter().circle_filled(pic.center(), ps / 2.0, p.widget_bg);
                 svgicon::paint(ui.painter(), pic.shrink(ps * 0.3), "artist", p.text_weak, svgicon::STROKE);
@@ -416,7 +422,7 @@ impl CodaApp {
             let meta_top = acts_top - 14.0 - 19.0;
             let title = one_line(ui, &page.name, heavy(30.0), p.text_strong, (x1 - x).max(60.0), false);
             let title_top = meta_top - 6.0 - 31.5 - (title.size().y - 31.5) / 2.0;
-            let kind = fin::spaced(ui, "PROFILE", bold(10.5), p.text_weak, 1.05);
+            let kind = fin::spaced(ui, "Profile", medium(12.0), p.text_weak, 0.0);
             let kind_top = meta_top - 6.0 - 31.5 - 4.0 - kind.size().y;
             ui.painter().galley(pos2(x, kind_top), kind, p.text_weak);
             ui.painter().galley(pos2(x, title_top), title, p.text_strong);

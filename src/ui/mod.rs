@@ -2,7 +2,8 @@
 //!
 //! Layout: playlists (left), Home or a list's page with Songs / Up next / Blocked tabs and a status
 //! line (middle), the record deck (right, Ctrl+D hides it), player bar (bottom); or the compact
-//! mini player. The side panels keep the widths the user drags them to, also after a restart.
+//! mini player. The sidebar and side panel keep the widths the user drags their edges to, also after
+//! a restart (see `frame.rs`).
 //! Settings opens in a window of its own docked beside the main one, as in Glint (or small in its
 //! middle, or in place of the three columns: "Settings opens"; see `settings.rs`). The UI never
 //! blocks: it sends [`Command`]s to the controller and drains [`Event`]s in `App::logic`, which
@@ -11,6 +12,7 @@
 mod accent;
 mod blur;
 mod collection;
+mod covercrop;
 mod narrow;
 mod nav;
 mod profile;
@@ -53,7 +55,6 @@ mod window;
 mod ytpick;
 
 use std::collections::HashSet;
-use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, MutexGuard};
 use std::time::{Duration, Instant};
@@ -61,7 +62,7 @@ use std::time::{Duration, Instant};
 use egui::{Align2, CornerRadius, Frame, Id, Margin, RichText, Sense};
 use tokio::sync::mpsc::UnboundedSender;
 
-use crate::config::{Paths, PlaylistFilter, Settings};
+use crate::config::{Paths, PlaylistFilter, Settings, ThemeMode};
 use crate::controller::SharedSettings;
 use crate::model::{
     Command, Event, LastfmStatus, LikesWaiting, PlayStatus, PlaybackState, PlaylistSummary, ShuffleRules, SleepTimerState,
@@ -263,6 +264,9 @@ pub struct CodaApp {
 
     playlists: Vec<PlaylistSummary>,
     library_loaded: bool,
+    /// Someone else's playlist being added to the library, and since when (its Add button
+    /// waits meanwhile, up to a few seconds).
+    adding_playlist: Option<(String, Instant)>,
     /// The playlist list couldn't be loaded and there is nothing to show (offer a retry).
     library_error: Option<String>,
     playlist_search: String,
@@ -304,9 +308,14 @@ pub struct CodaApp {
     new_playlist: Option<String>,
     /// The playlist "Delete…" was clicked for: the question box is open.
     confirm_remove: Option<String>,
+    /// Playlists' names, owners and likes as Spotify has them now (`Command::PlaylistDetails`),
+    /// for their pages.
+    playlist_details: std::collections::HashMap<String, crate::model::PlaylistDetails>,
     /// Playlist cards seen this run (search, profiles, artist pages), by URI: their name, owner and
-    /// cover for a page opened from one that isn't in the library.
+    /// cover for a page opened from one before (or without) Spotify's own answer.
     seen_playlists: std::collections::HashMap<String, crate::model::Card>,
+    /// The account's own listen-along link playlists (every list leaves them out).
+    link_playlists: Arc<Vec<crate::model::LinkPlaylist>>,
     /// The "Already in" questions: one for each add that found songs the playlist has, asked one
     /// at a time.
     already_in: library::AlreadyInState,
@@ -358,8 +367,10 @@ pub struct CodaApp {
     /// "Wrong song?": the YouTube videos that may be a song.
     yt_pick: Option<ytpick::YtPick>,
     cover_picker_open: bool,
-    cover_tx: Sender<(String, Option<PathBuf>)>,
-    cover_rx: Receiver<(String, Option<PathBuf>)>,
+    /// The crop step for a playlist's new cover, between picking the picture and uploading it.
+    cover_crop: Option<covercrop::CoverCropper>,
+    cover_tx: Sender<covercrop::CoverPick>,
+    cover_rx: Receiver<covercrop::CoverPick>,
     /// The wallpaper's picture (the choices are in `prefs.wallpaper`).
     wallpaper: WallpaperState,
 
@@ -485,6 +496,7 @@ impl CodaApp {
             reopened_last_source: false,
             playlists: Vec::new(),
             library_loaded: false,
+            adding_playlist: None,
             library_error: None,
             playlist_search: String::new(),
             playlist_filtered: Vec::new(),
@@ -511,7 +523,9 @@ impl CodaApp {
             pending_play: None,
             new_playlist: None,
             confirm_remove: None,
+            playlist_details: std::collections::HashMap::new(),
             seen_playlists: std::collections::HashMap::new(),
+            link_playlists: Arc::default(),
             already_in: library::AlreadyInState::default(),
             dupes: None,
             webapi_connected: false,
@@ -540,6 +554,7 @@ impl CodaApp {
             edit_details: None,
             yt_pick: None,
             cover_picker_open: false,
+            cover_crop: None,
             cover_tx,
             cover_rx,
             wallpaper: WallpaperState::default(),
@@ -760,6 +775,8 @@ impl CodaApp {
             s.start_with_windows = p.start_with_windows;
             s.discord_status = p.discord_status;
             s.discord_app_id = p.discord_app_id.clone();
+            s.discord_look = p.discord_look.clone();
+            s.discord_hidden = p.discord_hidden;
             s.dynamic_accent = p.dynamic_accent;
             s.compact = p.compact;
             s.screen_sizes = p.screen_sizes.clone();
@@ -773,6 +790,7 @@ impl CodaApp {
             s.library_width = p.library_width;
             s.deck_width = p.deck_width;
             s.banners = p.banners.clone();
+            s.list_sorts = p.list_sorts.clone();
             s.settings_size = p.settings_size;
             s.app_icon = p.app_icon;
             s.sidebar_folded = p.sidebar_folded;
@@ -833,8 +851,28 @@ impl CodaApp {
     /// Rebuilds the palette (theme, shown accent, custom colours, density) and applies it.
     fn restyle(&mut self, ctx: &egui::Context) {
         let accent = self.accent_fade.value(Instant::now());
-        self.palette = Palette::build(self.prefs.theme, accent, self.prefs.custom_colors.as_ref());
+        self.palette = Palette::build(self.shown_theme(), accent, self.prefs.custom_colors.as_ref());
         theme::apply_style(ctx, &self.palette, self.prefs.compact);
+    }
+
+    /// The theme drawn: the user's, or the one a self-shot asks for (`light`, `dark`).
+    fn shown_theme(&self) -> ThemeMode {
+        if self.shot_flag("light") {
+            ThemeMode::Light
+        } else if self.shot_flag("dark") {
+            ThemeMode::Dark
+        } else {
+            self.prefs.theme
+        }
+    }
+
+    /// A self-shot that asks for the other theme gets it for its picture, and the user's comes back
+    /// after (custom colours keep their own).
+    fn follow_shot_theme(&mut self, ctx: &egui::Context) {
+        let custom = self.prefs.custom_colors.as_ref().is_some_and(theme::has_custom_colors);
+        if !custom && theme::shows_dark(self.shown_theme()) != self.palette.dark {
+            self.restyle(ctx);
+        }
     }
 
     /// Moves the shown accent towards the album art's colour (dynamic accent) or the user's.
@@ -908,12 +946,18 @@ impl CodaApp {
         }
     }
 
+    /// One of the account's own listen-along link playlists.
+    fn link_playlist(&self, uri: &str) -> Option<&crate::model::LinkPlaylist> {
+        self.link_playlists.iter().find(|l| l.uri == uri)
+    }
+
     /// A dialog box is open over the window (its keys are its own).
     fn dialog_open(&self) -> bool {
         self.new_playlist.is_some()
             || self.confirm_remove.is_some()
             || self.edit_details.is_some()
             || self.yt_pick.is_some()
+            || self.cover_crop.is_some()
             || self.wallpaper.banners.adjusting.is_some()
             || self.dupes.is_some()
             || self.link_dialog.is_some()
@@ -940,9 +984,15 @@ impl CodaApp {
                 view.error = None;
             }
         } else {
-            self.view = Some(TrackView::new(source.clone()));
+            let mut view = TrackView::new(source.clone());
+            view.sort = self.prefs.list_sorts.get(&source.cache_key()).copied().unwrap_or_default();
+            self.view = Some(view);
         }
         self.send(Command::OpenSource { source: source.clone(), force_refresh });
+        // Its name, owner and likes as Spotify has them now.
+        if let Source::Playlist(uri) = &source {
+            self.send(Command::PlaylistDetails(uri.clone()));
+        }
         if self.prefs.last_source.as_ref() != Some(&source) {
             self.prefs.last_source = Some(source);
             self.prefs_changed();
@@ -1050,6 +1100,7 @@ impl CodaApp {
             Event::HeldBy { uris, playlists } => self.held_came(uris, playlists),
             Event::Status(text) => self.toast(text, false),
             Event::Error(text) => self.toast(text, true),
+            Event::TrackFound(track) => self.show_found_track(&track),
             Event::NeedLogin => {
                 self.auth = AuthState::NeedLogin;
                 self.interactive_login = false;
@@ -1119,6 +1170,8 @@ impl CodaApp {
                 self.friends_asked = None;
                 self.friend_peek.clear();
                 self.listen_links = Arc::default();
+                self.link_playlists = Arc::default();
+                self.playlist_details.clear();
                 self.link_dialog = None;
             }
             Event::Library(list) => {
@@ -1127,6 +1180,9 @@ impl CodaApp {
                 // there wasn't removed: it is asked after all).
                 self.already_in.listed(|uri| list.iter().any(|p| p.uri == uri));
                 self.playlists = list;
+                if self.adding_playlist.as_ref().is_some_and(|(uri, _)| self.playlists.iter().any(|p| p.uri == *uri)) {
+                    self.adding_playlist = None;
+                }
                 self.library_loaded = true;
                 self.library_error = None;
                 self.refilter_playlists();
@@ -1284,6 +1340,19 @@ impl CodaApp {
                 }
             }
             Event::Duplicates { uri, tracks } => self.on_duplicates(ctx, &uri, tracks),
+            Event::PlaylistDetails(details) => {
+                if let Some(s) = &details.summary {
+                    self.fonts.scan_all(ctx, [s.name.as_str(), s.owner_name.as_str()]);
+                }
+                self.playlist_details.insert(details.uri.clone(), details);
+            }
+            Event::LinkPlaylists(list) => {
+                // A question about a link playlist that went goes too.
+                if self.confirm_remove.as_ref().is_some_and(|u| self.playlist(u).is_none() && !list.iter().any(|l| l.uri == *u)) {
+                    self.confirm_remove = None;
+                }
+                self.link_playlists = list;
+            }
             Event::PlaylistRemoved { uri } => {
                 self.playlists.retain(|p| p.uri != uri);
                 self.already_in.drop_about(|u| u == uri);
@@ -1611,39 +1680,6 @@ impl CodaApp {
             self.toasts.retain(|t| t.text != text);
         }
     }
-
-    fn handle_cover_picks(&mut self) {
-        while let Ok((uri, path)) = self.cover_rx.try_recv() {
-            self.cover_picker_open = false;
-            if let Some(image_path) = path {
-                self.toast("Uploading the new cover…", false);
-                self.send(Command::SetPlaylistCover { uri, image_path });
-            }
-        }
-    }
-
-    /// Opens the native file picker on a background thread (it blocks until closed).
-    fn pick_cover(&mut self, ctx: &egui::Context, uri: String) {
-        if self.cover_picker_open {
-            return;
-        }
-        self.cover_picker_open = true;
-        let tx = self.cover_tx.clone();
-        let ctx = ctx.clone();
-        let spawned = std::thread::Builder::new().name("coda-file-dialog".into()).spawn(move || {
-            let path = rfd::FileDialog::new()
-                .set_title("Choose a cover image")
-                .add_filter("Images", &["jpg", "jpeg", "png", "webp"])
-                .pick_file();
-            let _ = tx.send((uri, path));
-            ctx.request_repaint();
-        });
-        if let Err(e) = spawned {
-            log::warn!("could not open the file picker: {e}");
-            self.cover_picker_open = false;
-            self.toast("Could not open the file picker.", true);
-        }
-    }
 }
 
 /// Which toast to drop when there are too many: the oldest status message other than the one just
@@ -1690,7 +1726,7 @@ impl eframe::App for CodaApp {
         }
         self.images.poll();
         self.fonts.poll(ctx);
-        self.handle_cover_picks();
+        self.handle_cover_picks(ctx);
         self.shell_logic(ctx);
         self.updater_logic(ctx);
         self.flush_settings_if_due(ctx);
@@ -1708,6 +1744,7 @@ impl eframe::App for CodaApp {
         let measured_zoom = self.screen_zoom.next_pass(ctx.zoom_factor(), ctx.current_pass_index() > 0);
         self.memory_probe(&ctx);
         self.frame.self_shot(&ctx, self.shell.hidden, self.shell.switched, self.shell.mini);
+        self.follow_shot_theme(&ctx);
         if self.shell.hidden {
             // eframe still runs passes for a hidden window; there is nothing to draw.
             return;
@@ -1743,6 +1780,7 @@ impl eframe::App for CodaApp {
                 self.settings_logic(&ctx);
                 self.edit_details_modal(&ctx);
                 self.yt_pick_modal(&ctx);
+                self.cover_crop_modal(&ctx);
                 self.new_playlist_modal(&ctx);
                 self.banner_adjust_modal(&ctx);
                 self.remove_playlist_modal(&ctx);
@@ -1753,6 +1791,9 @@ impl eframe::App for CodaApp {
             }
             if self.auth != AuthState::LoggedIn {
                 self.toasts_ui(&ctx);
+            }
+            if self.auth == AuthState::LoggedIn {
+                self.songs_drag_logic(&ctx);
             }
         }
         // A switch made while drawing (the mini player's own buttons) happens at the very end of

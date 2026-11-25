@@ -6,13 +6,13 @@ use std::collections::VecDeque;
 use std::ops::Range;
 use std::time::Duration;
 
-use egui::{Color32, Id, Key, PointerButton, Sense, TextEdit, Ui, pos2, vec2};
+use egui::{Color32, Id, Key, PointerButton, Rect, Sense, TextEdit, Ui, pos2, vec2};
 
 use super::fin;
 use super::theme::Palette;
 
 use super::CodaApp;
-use crate::model::{AlreadyIn, Command};
+use crate::model::{AlreadyIn, Command, Source};
 
 /// What a playlist's right-click menu asked for.
 pub(super) enum RowMenu {
@@ -21,9 +21,90 @@ pub(super) enum RowMenu {
     Edit(String),
     FindDuplicates(String),
     AskRemove(String),
+    /// Copy the playlist's open.spotify.com link.
+    CopyLink(String),
 }
 
 impl CodaApp {
+    /// Every pass while songs are dragged: the chip by the pointer, and, when no open sidebar shows
+    /// the playlists (folded to its strip, a narrow window, the Now playing view), the drop tray.
+    pub(super) fn songs_drag_logic(&mut self, ctx: &egui::Context) {
+        if !super::dnd::dragging_songs(ctx) {
+            return;
+        }
+        if !self.frame.song_targets {
+            self.drop_tray(ctx);
+        }
+        super::dnd::paint_chip(ctx, &self.palette);
+    }
+
+    /// "Drop on a playlist": the user's own playlists (pinned first) down the window's right side,
+    /// each taking songs let go on it. It scrolls when songs are held at its top or bottom.
+    fn drop_tray(&mut self, ctx: &egui::Context) {
+        let p = self.palette;
+        let mut mine: Vec<(String, String)> = Vec::new();
+        for uri in &self.prefs.pinned_playlists {
+            if let Some(pl) = self.playlist(uri).filter(|pl| pl.editable) {
+                mine.push((pl.uri.clone(), pl.name.clone()));
+            }
+        }
+        for pl in self.playlists.iter().filter(|pl| pl.editable && !self.prefs.pinned_playlists.contains(&pl.uri)) {
+            mine.push((pl.uri.clone(), pl.name.clone()));
+        }
+        let screen = ctx.content_rect();
+        let w = 230.0_f32.min(screen.width() * 0.45);
+        let rect = Rect::from_min_max(pos2(screen.right() - w - 10.0, screen.top() + 56.0), pos2(screen.right() - 10.0, screen.bottom() - 20.0));
+        let mut dropped: Option<(String, Vec<String>)> = None;
+        egui::Area::new(Id::new("drop-tray")).order(egui::Order::Foreground).fixed_pos(rect.min).interactable(true).show(ctx, |ui| {
+            ui.painter().add(egui::Shadow { offset: [0, 8], blur: 28, spread: 0, color: Color32::from_black_alpha(120) }.as_shape(rect, egui::CornerRadius::same(12)));
+            ui.painter().rect_filled(rect, egui::CornerRadius::same(12), p.raised_bg);
+            ui.painter().rect_stroke(rect, egui::CornerRadius::same(12), egui::Stroke::new(1.0, p.border), egui::StrokeKind::Inside);
+            let head = fin::spaced(ui, "Drop on a playlist", super::theme::bold(12.0), p.text, 0.0);
+            ui.painter().galley(pos2(rect.left() + 14.0, rect.top() + 12.0), head, p.text_weak);
+            let list = Rect::from_min_max(pos2(rect.left() + 6.0, rect.top() + 34.0), pos2(rect.right() - 6.0, rect.bottom() - 6.0));
+            let mut child = ui.new_child(egui::UiBuilder::new().max_rect(list));
+            child.set_clip_rect(list);
+            egui::ScrollArea::vertical().id_salt("drop-tray-list").auto_shrink(false).show(&mut child, |ui| {
+                super::dnd::edge_scroll(ui);
+                if mine.is_empty() {
+                    ui.label(egui::RichText::new("No playlists of yours yet").color(p.text_weak));
+                    return;
+                }
+                let x = ui.max_rect().left();
+                let width = ui.available_width();
+                let mut y = ui.cursor().top();
+                for (uri, name) in &mine {
+                    let row = Rect::from_min_size(pos2(x, y), vec2(width, 34.0));
+                    let resp = ui.interact(row, Id::new(("drop-tray", uri)), Sense::hover());
+                    if resp.contains_pointer() {
+                        ui.painter().rect_filled(row, egui::CornerRadius::same(6), p.hover_bg);
+                    }
+                    super::svgicon::paint(ui.painter(), Rect::from_center_size(pos2(row.left() + 16.0, row.center().y), vec2(14.0, 14.0)), "lib", p.text_weak, super::svgicon::STROKE);
+                    let g = super::tracks::one_line(ui, name, super::theme::medium(12.0), p.text, width - 40.0, false);
+                    let gh = g.size().y;
+                    ui.painter().galley(pos2(row.left() + 32.0, row.center().y - gh / 2.0), g, p.text);
+                    if let Some(songs) = super::dnd::drop_on(ui, &resp, row, &p) {
+                        dropped = Some((uri.clone(), songs.uris));
+                    }
+                    y += 34.0;
+                }
+                ui.allocate_space(vec2(width, (y - ui.cursor().top()).max(0.0)));
+            });
+        });
+        if let Some((uri, uris)) = dropped {
+            self.add_dropped_songs(uri, uris);
+        }
+    }
+
+    /// Copies a playlist's, album's or artist's open.spotify.com link (none for Liked Songs and
+    /// Coda's own mixes, which have no page on Spotify).
+    pub(super) fn copy_link(&mut self, uri: &str) {
+        if let Some(link) = super::util::spotify_web_link(uri) {
+            self.ctx.copy_text(link);
+            self.note("Link copied", None);
+        }
+    }
+
     /// Songs dropped on a playlist (a row or a sleeve) go to its end. Local files can't.
     pub(super) fn add_dropped_songs(&mut self, playlist_uri: String, mut uris: Vec<String>) {
         uris.retain(|u| !u.starts_with("spotify:local:"));
@@ -58,6 +139,7 @@ impl CodaApp {
             RowMenu::Edit(uri) => self.open_edit_details(&uri),
             RowMenu::FindDuplicates(uri) => self.find_duplicates(&uri),
             RowMenu::AskRemove(uri) => self.confirm_remove = Some(uri),
+            RowMenu::CopyLink(uri) => self.copy_link(&uri),
         }
     }
 
@@ -65,19 +147,30 @@ impl CodaApp {
     pub(super) fn remove_playlist_modal(&mut self, ctx: &egui::Context) {
         let p = self.palette;
         let Some(uri) = self.confirm_remove.clone() else { return };
-        let Some(pl) = self.playlist(&uri) else {
-            self.confirm_remove = None;
-            return;
+        // One of the account's listen-along link playlists: its link goes with it.
+        let link = self.link_playlist(&uri).map(|l| l.link.clone());
+        let (name, owned) = match (self.playlist(&uri), &link) {
+            (Some(pl), _) => (pl.name.clone(), pl.editable),
+            (None, Some(_)) => (String::new(), true),
+            (None, None) => {
+                self.confirm_remove = None;
+                return;
+            }
         };
-        let (name, owned) = (pl.name.clone(), pl.editable);
         let (mut yes, mut no) = (false, false);
         let modal = fin::dialog(ctx, Id::new("remove_playlist"), |ui| {
             ui.set_width(400.0);
-            let title = if owned { format!("Delete \"{name}\"?") } else { format!("Remove \"{name}\" from your library?") };
-            let note = if owned {
-                "It leaves your Spotify library. Spotify keeps it for 90 days, so it can come back on spotify.com."
-            } else {
-                "You stop following it. The playlist stays on Spotify."
+            let title = match &link {
+                Some(Some((_, who))) => format!("Delete {who}'s link?"),
+                Some(None) => "Delete this link playlist?".to_owned(),
+                None if owned => format!("Delete \"{name}\"?"),
+                None => format!("Remove \"{name}\" from your library?"),
+            };
+            let note = match &link {
+                Some(Some(_)) => "The link stops working and leaves your links. Its playlist leaves your Spotify library.",
+                Some(None) => "No link on this PC uses it. It leaves your Spotify library.",
+                None if owned => "It leaves your Spotify library. Spotify keeps it for 90 days, so it can come back on spotify.com.",
+                None => "You stop following it. The playlist stays on Spotify.",
             };
             fin::dialog_head(ui, &title, Some(note));
             let (ok, cancel) = fin::dialog_actions(ui, &p, Id::new("remove_playlist"), if owned { "Delete" } else { "Remove" }, true);
@@ -91,7 +184,15 @@ impl CodaApp {
             self.confirm_remove = None;
             // Not asked "Already in" about it while it goes.
             self.already_in.removing(uri.clone());
-            self.send(Command::RemovePlaylist { uri });
+            if link.is_some() {
+                // Its page goes at once (the playlist leaves once the link said stopped).
+                if self.view.as_ref().is_some_and(|v| v.source == Source::Playlist(uri.clone())) {
+                    self.view = None;
+                }
+                self.send(Command::DeleteLinkPlaylist(uri));
+            } else {
+                self.send(Command::RemovePlaylist { uri });
+            }
         } else if no || modal.should_close() {
             self.confirm_remove = None;
         }
@@ -447,6 +548,10 @@ pub(super) fn playlist_menu(ui: &mut Ui, uri: &str, pinned: bool, editable: bool
     }
     if editable && fin::menu_item(ui, Some("search"), "Find duplicates", None, false, true).clicked() {
         *menu = Some(RowMenu::FindDuplicates(uri.to_owned()));
+        ui.close();
+    }
+    if fin::menu_item(ui, Some("link"), "Copy link", None, false, true).clicked() {
+        *menu = Some(RowMenu::CopyLink(uri.to_owned()));
         ui.close();
     }
     if fin::menu_item(ui, Some("refresh"), "Refresh playlists", None, false, true).clicked() {

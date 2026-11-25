@@ -572,6 +572,58 @@ impl CodaApp {
         self.paint_wallpaper(ui, area);
     }
 
+
+    /// Inside a card (the sidebar, the page, the side panel) while the wallpaper covers the whole
+    /// window: the picture again, at `share` of its strength, so text keeps a calm ground while the
+    /// picture still shows through. With the wallpaper behind the songs only, the page shows it as
+    /// before.
+    pub(super) fn wallpaper_in_card(&mut self, ui: &Ui, songs: bool, share: f32) {
+        let w = &self.prefs.wallpaper;
+        if w.whole_window {
+            if songs {
+                self.wallpaper.songs_area = ui.max_rect();
+            }
+            if let Some((texture, size)) = self.wallpaper.shown(w) {
+                let own = 1.0 / ui.ctx().pixels_per_point();
+                let area = ui.ctx().content_rect();
+                if let Some(mesh) = wallpaper_mesh(texture, size, area, ui.clip_rect(), w, own, strength(w) * share) {
+                    ui.painter().add(mesh);
+                }
+            }
+        } else if songs {
+            self.wallpaper_behind_songs(ui);
+        }
+    }
+
+    /// Rounds a card's corners off after its contents are drawn: the bits outside the curve get the
+    /// window's base again, with the wallpaper as it shows between the cards.
+    pub(super) fn round_card_corners(&self, painter: &egui::Painter, card: Rect, radius: f32, base: Color32) {
+        let w = &self.prefs.wallpaper;
+        let picture = (super::frame::WALL_IN_GAPS && w.whole_window).then(|| self.wallpaper.shown(w)).flatten();
+        let window = painter.ctx().content_rect();
+        let own = 1.0 / painter.ctx().pixels_per_point();
+        for corner in 0..4 {
+            let fan = corner_cut(card, radius, corner);
+            painter.add(fan_mesh(&fan, None, |_| (Pos2::ZERO, base)));
+            if let Some((texture, size)) = picture {
+                let rect = place(size, window, w, own);
+                let (fade, tiled) = (soft_edges(w), w.fit == WallpaperFit::Tile);
+                let strength = strength(w);
+                painter.add(fan_mesh(&fan, Some(texture), |p| {
+                    let uv = pos2((p.x - rect.left()) / rect.width(), (p.y - rect.top()) / rect.height());
+                    let inside = tiled || rect.contains(p);
+                    let a = if inside && rect.is_positive() {
+                        strength
+                            * fade_alpha((p.x - window.left()) / window.width(), fade)
+                            * fade_alpha((p.y - window.top()) / window.height(), fade)
+                    } else {
+                        0.0
+                    };
+                    (uv, Color32::WHITE.gamma_multiply(a))
+                }));
+            }
+        }
+    }
     /// Paints the picture laid out in `area`, only the part inside the panel; the panel's contents
     /// draw on top.
     fn paint_wallpaper(&self, ui: &Ui, area: Rect) {
@@ -889,6 +941,39 @@ fn place(size: Vec2, area: Rect, w: &Wallpaper, own: f32) -> Rect {
     let x = area.left() + (area.width() - shown.x) * w.at_x;
     let y = area.top() + (area.height() - shown.y) * w.at_y;
     Rect::from_min_size(pos2(x, y), shown)
+}
+
+/// The bit of `card` outside its rounded corner `corner` (0 top left, then clockwise), as a fan:
+/// the square corner first, then the curve from one side to the other.
+pub(super) fn corner_cut(card: Rect, radius: f32, corner: usize) -> Vec<Pos2> {
+    const STEPS: usize = 6;
+    let r = radius.min(card.width() / 2.0).min(card.height() / 2.0).max(0.0);
+    let (square, center, start) = match corner {
+        0 => (card.left_top(), card.left_top() + vec2(r, r), std::f32::consts::PI),
+        1 => (card.right_top(), card.right_top() + vec2(-r, r), 1.5 * std::f32::consts::PI),
+        2 => (card.right_bottom(), card.right_bottom() + vec2(-r, -r), 0.0),
+        _ => (card.left_bottom(), card.left_bottom() + vec2(r, -r), 0.5 * std::f32::consts::PI),
+    };
+    let mut fan = vec![square];
+    for k in 0..=STEPS {
+        let a = start + std::f32::consts::FRAC_PI_2 * k as f32 / STEPS as f32;
+        fan.push(center + r * vec2(a.cos(), a.sin()));
+    }
+    fan
+}
+
+/// A fan of triangles from `fan[0]`, each point's texture place and colour from `at`.
+fn fan_mesh(fan: &[Pos2], texture: Option<TextureId>, at: impl Fn(Pos2) -> (Pos2, Color32)) -> Mesh {
+    let mut mesh = texture.map_or_else(Mesh::default, Mesh::with_texture);
+    for &p in fan {
+        let (uv, color) = at(p);
+        let uv = if texture.is_some() { uv } else { egui::epaint::WHITE_UV };
+        mesh.vertices.push(Vertex { pos: p, uv, color });
+    }
+    for k in 1..fan.len().saturating_sub(1) as u32 {
+        mesh.add_triangle(0, k, k + 1);
+    }
+    mesh
 }
 
 /// The wallpaper drawn in `area` as Glint draws it: placed (see [`place`]), once or tiled all over
@@ -1319,6 +1404,25 @@ fn io_reason(e: &std::io::Error) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_card_corner_is_cut_between_its_curve_and_the_square_corner() {
+        let card = Rect::from_min_max(pos2(10.0, 20.0), pos2(110.0, 220.0));
+        for corner in 0..4 {
+            let fan = corner_cut(card, 10.0, corner);
+            let square = fan[0];
+            assert!([card.left_top(), card.right_top(), card.right_bottom(), card.left_bottom()][corner] == square);
+            // The curve runs from one side to the other, 10 from the corner, and bows in toward it.
+            let (first, last) = (fan[1], *fan.last().unwrap());
+            assert!(((first - square).length() - 10.0).abs() < 0.01 && ((last - square).length() - 10.0).abs() < 0.01);
+            assert!(fan[1..].iter().all(|p| card.expand(0.01).contains(*p)));
+            let mid = fan[fan.len() / 2 + 1];
+            assert!((mid - square).length() < 10.0 && (mid - square).length() > 2.0);
+        }
+        // A card smaller than its corners rounds by half its size.
+        let tiny = Rect::from_min_size(Pos2::ZERO, vec2(8.0, 30.0));
+        assert!((corner_cut(tiny, 10.0, 0)[1] - pos2(0.0, 4.0)).length() < 0.01);
+    }
     use super::*;
 
     /// A 200 x 100 picture in a 100 x 100 area at the origin (at its own size, a pixel a point).

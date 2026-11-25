@@ -30,8 +30,8 @@ const MAX_CONSECUTIVE_FAILURES: u32 = 5;
 const POSITION_DRIFT_MS: u32 = 1_500;
 /// A seek to the same position this soon after the last one is ignored.
 const SEEK_REPEAT_WINDOW: Duration = Duration::from_millis(500);
-/// Length of the "Up next" preview sent to the UI.
-const UP_NEXT_LEN: usize = 50;
+/// Up next lists every song still to come (the side panel draws only the rows in view).
+const UP_NEXT_LEN: usize = usize::MAX;
 /// An end of track reported more than this before the track's length is an interruption.
 const EARLY_END_MARGIN_MS: u32 = 10_000;
 /// An interrupted track resumes this much before where it was reported to stop: librespot waits
@@ -48,6 +48,13 @@ const YOUTUBE_LENGTH_SLACK_MS: u32 = 15_000;
 /// How long a successful reachability check is trusted (so skipping several unplayable tracks in
 /// a row needs only one check).
 const REACHABLE_TRUST: Duration = Duration::from_secs(20);
+/// Songs failing this close together on Spotify: none of them is greyed out (one looking gone
+/// may only be Spotify failing).
+pub(super) const OUTAGE_WINDOW: Duration = Duration::from_secs(120);
+/// Songs Spotify refuses to stream (it answers about them, but won't hand out the key that
+/// unlocks their audio) are skipped quietly. This many in a row with nothing played between
+/// stops playback, so a whole list isn't skipped through.
+pub(super) const MAX_REFUSED_IN_ROW: u32 = 25;
 
 /// Why the controller checks whether Spotify can be reached.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -334,6 +341,7 @@ impl Controller {
             EngineEvent::Playing { uri, position_ms } => {
                 if self.is_current(&uri) {
                     self.failures = 0;
+                    self.refused_in_row = 0;
                     self.pending_reload = false;
                     self.want_play = true;
                     self.set_status(PlayStatus::Playing);
@@ -489,11 +497,30 @@ impl Controller {
             }
             self.source_problem = problem;
         }
+        if self.sound_source() == SoundSource::Spotify && !self.listening() {
+            // Kept so a song looking gone while others fail too isn't greyed out. A run of failures
+            // never pauses: they are songs Spotify refuses one by one (see `on_recheck`).
+            self.note_spotify_failure();
+        }
         self.pending_reload = true;
         if self.want_play {
             self.set_status(PlayStatus::Loading);
         }
         self.wait_for_spotify(ProbeKind::Unavailable);
+    }
+
+    /// A song failed on Spotify: kept for [`OUTAGE_WINDOW`].
+    fn note_spotify_failure(&mut self) {
+        let now = Instant::now();
+        self.recent_failures.retain(|at| now.duration_since(*at) < OUTAGE_WINDOW);
+        self.recent_failures.push(now);
+    }
+
+    /// Other songs failed shortly before this one: a song looking gone from Spotify now may only be
+    /// Spotify failing, so it isn't greyed out.
+    fn failing_lately(&self) -> bool {
+        let now = Instant::now();
+        self.recent_failures.iter().filter(|at| now.duration_since(**at) < OUTAGE_WINDOW).count() > 1
     }
 
     /// Before blaming the current track, make sure Spotify can be reached: while the connection is
@@ -597,7 +624,9 @@ impl Controller {
         }
         // Still waiting on this track: not moved on or reloaded since.
         let waiting = asked && self.is_current(uri) && self.pending_reload;
-        let gone = matches!(&result, Ok(t) if !t.playable);
+        // While other songs fail too, Spotify's answer may come without the song's audio when it has
+        // it: not greyed out then (skipped as a failure).
+        let gone = matches!(&result, Ok(t) if !t.playable) && !self.failing_lately();
         if gone && (waiting || !self.is_current(uri)) {
             self.grey_out(uri);
         }
@@ -612,8 +641,23 @@ impl Controller {
         }
         if let Err(e) = &result {
             log::warn!("could not look up \"{name}\" again: {e:#}");
+            self.skip_unplayable(&format!("Skipped \"{name}\" because Spotify can't play it right now."), true);
+            return;
         }
-        self.skip_unplayable(&format!("Skipped \"{name}\" because Spotify can't play it right now."), true);
+        // Spotify answers about the song on a working connection, yet won't stream it: its own
+        // refusal (song by song, for good), nothing about the connection. Skipped quietly.
+        self.refused_in_row += 1;
+        if self.refused_in_row >= MAX_REFUSED_IN_ROW {
+            log::warn!("{MAX_REFUSED_IN_ROW} songs in a row refused by Spotify; stopping");
+            self.refused_in_row = 0;
+            self.stop_playback();
+            self.ui.send(Event::Error(format!(
+                "Spotify refused {MAX_REFUSED_IN_ROW} songs in a row, so coda stopped here. Press play to go on."
+            )));
+            return;
+        }
+        log::info!("\"{name}\" refused by Spotify; skipped");
+        self.skip_unplayable(&format!("Skipped \"{name}\": Spotify won't stream this song to coda."), false);
     }
 
     /// `uri` can't be played any more: greyed out in the queue (it leaves the play order; as the
@@ -882,13 +926,12 @@ impl Controller {
     }
 
     /// Replace the queue with a new one for `source` and start playing.
-    pub(super) fn start_source(
-        &mut self,
-        source: Source,
-        tracks: Arc<Vec<TrackInfo>>,
-        start_index: Option<usize>,
-        shuffle: bool,
-    ) {
+    pub(super) fn start_source(&mut self, source: Source, tracks: Arc<Vec<TrackInfo>>, start_index: Option<usize>, shuffle: bool) {
+        self.start_source_in(source, tracks, start_index, shuffle, None);
+    }
+
+    /// [`start_source`](Self::start_source), unshuffled in `order` (places in `tracks`) when given.
+    fn start_source_in(&mut self, source: Source, tracks: Arc<Vec<TrackInfo>>, start_index: Option<usize>, shuffle: bool, order: Option<Vec<usize>>) {
         if self.listening() {
             // Asked for before listening along started.
             log::info!("not starting {source:?}: listening along");
@@ -896,7 +939,10 @@ impl Controller {
         }
         self.leave_current();
         let rules = self.rules();
-        let queue = PlayQueue::new(source, tracks, start_index, shuffle, &rules, &self.history);
+        let mut queue = PlayQueue::new(source, tracks, start_index, shuffle, &rules, &self.history);
+        if let Some(order) = order {
+            queue.use_order(order, start_index, &rules, &self.history);
+        }
         if queue.current().is_none() {
             self.ui.send(Event::Error(
                 "There's nothing playable here. The tracks may be unavailable in your country, removed from Spotify, or local files on another device.".into(),
@@ -1020,6 +1066,22 @@ impl Controller {
         }
     }
 
+    /// Plays a list unshuffled in the order its sorted page shows. A list not loaded here yet (or
+    /// changed since) plays in its own order.
+    pub(super) fn cmd_play_in_order(&mut self, source: Source, order: Vec<usize>, start_index: Option<usize>) {
+        if self.library.is_none() {
+            self.ui.send(Event::Error("Log in to Spotify to play music.".into()));
+            return;
+        }
+        let Some(tracks) = self.known_tracks(&source).filter(|t| order.len() == t.len()) else {
+            self.cmd_play_source(source, start_index, false);
+            return;
+        };
+        self.update_settings(|s| s.shuffle = false);
+        self.play_req = self.new_id();
+        self.start_source_in(source, tracks, start_index, false, Some(order));
+    }
+
     /// Start a list over: the songs heard in its round so far count as unheard again, and it plays
     /// in a fresh random order. The song playing now keeps its turn in the round it played in.
     pub(super) fn cmd_new_round(&mut self, source: Source) {
@@ -1114,6 +1176,18 @@ impl Controller {
         }
         self.refresh_preload();
         self.sync_queue_info();
+    }
+
+    /// A song dragged to another place in Up next.
+    pub(super) fn cmd_move_queued(&mut self, from: usize, to: usize) {
+        let rules = self.rules();
+        let Some(queue) = self.queue.as_mut() else { return };
+        if !queue.move_upcoming(from, to, &rules, &self.history) {
+            return;
+        }
+        self.state_dirty = true;
+        self.sync_queue_info();
+        self.upcoming_changed();
     }
 
     pub(super) fn cmd_next(&mut self) {
@@ -1307,6 +1381,7 @@ impl Controller {
 mod tests {
     use std::collections::HashSet;
     use std::sync::{Arc, Mutex};
+    use std::time::Instant;
 
     use super::{changed_round_progress, deck_state};
     use crate::config::{Paths, Settings};
@@ -1384,15 +1459,62 @@ mod tests {
     }
 
     #[test]
-    fn songs_spotify_still_has_count_as_failures_and_stop_playback_after_a_few() {
+    fn songs_spotify_refuses_are_skipped_quietly_never_greyed_and_never_stop_playback() {
+        let mut c = playing_list("refused", 10);
+        // Spotify answers about each song (it exists), but the player couldn't get its audio.
+        for i in 0..8 {
+            answer(&mut c, i as u64, Ok(track(i)));
+        }
+        assert!(c.is_current("spotify:track:8"), "each one was skipped");
+        assert_ne!(c.pb.status, PlayStatus::Stopped);
+        assert_eq!(c.failures, 0, "refusals say nothing about the connection");
+        assert!(c.queue.as_ref().expect("a queue").tracks().iter().all(|t| t.playable), "nothing greyed out");
+        done(c);
+    }
+
+    #[test]
+    fn a_long_run_of_refused_songs_stops_instead_of_skipping_the_whole_list() {
+        let n = super::MAX_REFUSED_IN_ROW as usize + 5;
+        let mut c = playing_list("refused-run", n);
+        for i in 0..super::MAX_REFUSED_IN_ROW as usize {
+            answer(&mut c, i as u64, Ok(track(i)));
+        }
+        assert_eq!(c.pb.status, PlayStatus::Stopped);
+        done(c);
+    }
+
+    #[test]
+    fn songs_that_couldnt_be_asked_about_count_as_failures_and_stop_playback_after_a_few() {
         let mut c = playing_list("failing", 8);
         for i in 0..5 {
-            // Spotify lists audio for the song, or couldn't be asked.
-            let result = if i % 2 == 0 { Ok(track(i)) } else { Err(anyhow::anyhow!("no answer")) };
-            answer(&mut c, i as u64, result);
+            answer(&mut c, i as u64, Err(anyhow::anyhow!("no answer")));
         }
         assert_eq!(c.pb.status, PlayStatus::Stopped);
         assert!(c.queue.as_ref().expect("a queue").tracks().iter().all(|t| t.playable), "nothing greyed out");
+        done(c);
+    }
+
+    #[test]
+    fn songs_failing_close_together_never_pause_playback() {
+        let mut c = playing_list("no-outage-pause", 8);
+        for _ in 0..4 {
+            c.on_unavailable();
+        }
+        // Before, the third one paused here, on song 2.
+        assert!(c.is_current("spotify:track:4"), "each one skipped, no pause");
+        assert_ne!(c.pb.status, PlayStatus::Stopped);
+        assert!(c.queue.as_ref().expect("a queue").tracks().iter().all(|t| t.playable), "nothing greyed out");
+        done(c);
+    }
+
+    #[test]
+    fn a_song_looking_gone_while_others_fail_too_is_not_greyed_out() {
+        let mut c = playing_list("not-gone", 4);
+        let now = Instant::now();
+        c.recent_failures = vec![now, now];
+        answer(&mut c, 1, gone(0));
+        assert!(c.queue.as_ref().expect("a queue").tracks()[0].playable, "kept");
+        assert!(c.is_current("spotify:track:1"), "skipped as a failure");
         done(c);
     }
 

@@ -120,6 +120,29 @@ impl CodaApp {
         }
     }
 
+    /// Opens what a pasted Spotify link or uri points at: a playlist's, album's or artist's page,
+    /// a person's profile, or a song's album with the song found in it. False if `text` isn't one.
+    pub(super) fn open_pasted_link(&mut self, text: &str) -> bool {
+        let Some(uri) = pasted_link(text) else { return false };
+        if let Some(user) = uri.strip_prefix("spotify:user:") {
+            self.show_user(user);
+        } else if uri.starts_with("spotify:track:") {
+            self.send(Command::FindTrack(uri));
+        } else {
+            self.open_source(source_of(&uri), false);
+        }
+        true
+    }
+
+    /// A song from a pasted link, once its details came: its album, scrolled to it.
+    pub(super) fn show_found_track(&mut self, t: &TrackInfo) {
+        if t.album_uri.starts_with("spotify:album:") {
+            self.show_track_in(Source::Album(t.album_uri.clone()), t.uri.clone());
+        } else {
+            self.toast("Couldn't find the album of that song.", true);
+        }
+    }
+
     /// Starts the song waiting in `pending_play` once its list is on screen.
     pub(super) fn start_pending_play(&mut self) {
         let Some((source, uri)) = self.pending_play.clone() else { return };
@@ -128,6 +151,31 @@ impl CodaApp {
         self.pending_play = None;
         let shuffle = self.current_shuffle();
         self.send(Command::PlaySource { source, start_index: Some(index), shuffle });
+    }
+}
+
+/// The Spotify uri in a pasted link (`https://open.spotify.com/intl-de/album/<id>?si=…`, the old
+/// `…/user/<name>/playlist/<id>`) or uri (`spotify:track:<id>`, `spotify:user:<name>:playlist:<id>`):
+/// a playlist, album, artist, song or person. `None` for anything else, which is searched for.
+pub(super) fn pasted_link(text: &str) -> Option<String> {
+    let text = text.trim();
+    if text.contains(char::is_whitespace) {
+        return None;
+    }
+    let parts: Vec<&str> = if let Some(rest) = text.strip_prefix("spotify:") {
+        rest.split(':').collect()
+    } else {
+        let rest = text.strip_prefix("https://").or_else(|| text.strip_prefix("http://")).unwrap_or(text);
+        let rest = rest.strip_prefix("open.spotify.com/")?;
+        let path = rest.split(['?', '#']).next().unwrap_or_default();
+        path.split('/').filter(|p| !p.is_empty() && !p.starts_with("intl-")).collect()
+    };
+    let id_ok = |id: &str| !id.is_empty() && id.chars().all(|c| c.is_ascii_alphanumeric());
+    match parts.as_slice() {
+        ["user", _, "playlist", id] if id_ok(id) => Some(format!("spotify:playlist:{id}")),
+        [kind @ ("playlist" | "album" | "artist" | "track"), id] if id_ok(id) => Some(format!("spotify:{kind}:{id}")),
+        ["user", name] if !name.is_empty() => Some(format!("spotify:user:{name}")),
+        _ => None,
     }
 }
 
@@ -150,6 +198,30 @@ mod tests {
     fn page(query: &str, offset: u32, ids: &[&str], next: Option<u32>) -> SearchResults {
         let users = ids.iter().map(|&id| Card { uri: format!("spotify:user:{id}"), name: id.into(), subtitle: id.into(), image: None }).collect();
         SearchResults { query: query.into(), offset, users, users_next: next, ..Default::default() }
+    }
+
+    #[test]
+    fn pasted_links_and_uris_open_their_page_and_anything_else_is_searched() {
+        let id = "37i9dQZF1DXcBWIGoYBM5M";
+        let cases = [
+            (format!("https://open.spotify.com/playlist/{id}?si=abc123"), Some(format!("spotify:playlist:{id}"))),
+            (format!("  https://open.spotify.com/intl-de/album/{id}?si=x  "), Some(format!("spotify:album:{id}"))),
+            (format!("open.spotify.com/artist/{id}"), Some(format!("spotify:artist:{id}"))),
+            (format!("https://open.spotify.com/track/{id}#x"), Some(format!("spotify:track:{id}"))),
+            (format!("https://open.spotify.com/user/bob/playlist/{id}"), Some(format!("spotify:playlist:{id}"))),
+            ("https://open.spotify.com/user/mira.l?si=1".to_owned(), Some("spotify:user:mira.l".to_owned())),
+            (format!("spotify:track:{id}"), Some(format!("spotify:track:{id}"))),
+            (format!("spotify:user:bob:playlist:{id}"), Some(format!("spotify:playlist:{id}"))),
+            ("spotify".to_owned(), None),
+            ("open spotify playlist".to_owned(), None),
+            ("https://example.com/album/abc".to_owned(), None),
+            ("https://open.spotify.com/episode/abc".to_owned(), None),
+            ("https://open.spotify.com/album/".to_owned(), None),
+            ("spotify:album:ab-c".to_owned(), None),
+        ];
+        for (text, want) in cases {
+            assert_eq!(pasted_link(&text), want, "{text}");
+        }
     }
 
     fn ids(s: &SearchState) -> Vec<&str> {

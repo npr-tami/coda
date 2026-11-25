@@ -115,12 +115,12 @@ pub(super) fn key_chip_at(ui: &Ui, keys: &str, right: f32, cy: f32) -> Rect {
     rect
 }
 
-/// A group's rows from `top`, `x0..x1` wide: its name in small capitals, then what each key does on
+/// A group's rows from `top`, `x0..x1` wide: its name (12 px semibold, as written), then what each key does on
 /// the left and the keys on the right. Returns the bottom.
 pub(super) fn paint_group(ui: &Ui, x0: f32, x1: f32, top: f32, name: &str, rows: &[(&str, &str)]) -> f32 {
     let p = crate::ui::theme::palette(ui.ctx());
-    let g = fin::spaced(ui, &name.to_uppercase(), bold(10.0), p.text_weak, 0.8);
-    ui.painter().galley(pos2(x0, top + GROUP_HEAD / 2.0 - g.size().y / 2.0), g, p.text_weak);
+    let g = fin::spaced(ui, name, bold(12.0), p.text, 0.0);
+    ui.painter().galley(pos2(x0, top + GROUP_HEAD / 2.0 - g.size().y / 2.0), g, p.text);
     let mut y = top + GROUP_HEAD;
     for (keys, what) in rows {
         let cy = y + ROW_H / 2.0;
@@ -242,13 +242,16 @@ impl CodaApp {
         let shown = egui::Area::new(Id::new("note-popup")).order(Order::Foreground).fixed_pos(pos2(0.0, 0.0)).fade_in(false).interactable(true).show(ctx, |ui| {
             let screen = ctx.content_rect();
             let max_w = (screen.width() - 120.0).clamp(120.0, 560.0);
-            let g = one_line(ui, &text, regular(12.0), p.text, max_w, false);
             let action = if undoable { Some("Undo") } else if error { Some("×") } else { None };
             let ag = action.map(|a| ui.painter().layout_no_wrap(a.to_owned(), if a == "Undo" { bold(11.5) } else { regular(14.0) }, p.accent_ink));
+            // A long note wraps onto more lines (the pill grows upwards) instead of being cut off.
+            let text_w = (max_w - ag.as_ref().map_or(0.0, |a| 16.0 + a.size().x)).max(80.0);
+            let g = ui.painter().layout(text.clone(), regular(12.0), p.text, text_w);
             let inner = 14.0 + 6.0 + 9.0 + g.size().x + ag.as_ref().map_or(0.0, |a| 16.0 + a.size().x) + 14.0;
+            let height = (g.size().y + 18.0).max(34.0);
             // Centred on `cx` (over the play button), but never past the window's edges.
             let x = (cx - inner / 2.0).clamp(screen.left() + 8.0, (screen.right() - 8.0 - inner).max(screen.left() + 8.0));
-            let pill = Rect::from_min_size(pos2(x, bottom - 34.0), vec2(inner, 34.0));
+            let pill = Rect::from_min_size(pos2(x, bottom - height), vec2(inner, height));
             // Clicks on the pill stay on it (not on the song rows under it).
             let _ = ui.interact(pill, Id::new("note-pill"), Sense::click());
             ui.multiply_opacity(arrived);
@@ -256,7 +259,9 @@ impl CodaApp {
                 ui.painter().add(Shadow { offset: [0, 8], blur: 24, spread: 0, color: Color32::from_black_alpha(150) }.as_shape(pill, CornerRadius::same(8)));
                 ui.painter().rect_filled(pill, CornerRadius::same(8), p.raised_bg);
                 ui.painter().rect_stroke(pill, CornerRadius::same(8), Stroke::new(1.0, p.border), StrokeKind::Inside);
-                let dot = pos2(pill.left() + 14.0 + 3.0, pill.center().y);
+                // The dot sits by the first line when the note wraps.
+                let first_line = g.rows.first().map_or(g.size().y, |r| r.rect().height());
+                let dot = pos2(pill.left() + 14.0 + 3.0, pill.center().y - (g.size().y - first_line) / 2.0);
                 ui.painter().circle_filled(dot, 3.0, if error { p.error } else { p.accent_ink });
                 let tx = dot.x + 3.0 + 9.0;
                 let gw = g.size().x;

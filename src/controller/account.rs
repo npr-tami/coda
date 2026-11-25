@@ -182,6 +182,7 @@ impl Controller {
         if let Some(playlists) = self.library.as_ref().and_then(|l| l.cached_playlists()) {
             self.playlists = playlists;
             self.ui.send(Event::Library(self.playlists_for_ui()));
+            self.send_link_playlists();
         }
         if let Some(liked) = persist::load_liked(&self.paths, &profile.username) {
             self.liked = liked;
@@ -400,6 +401,7 @@ impl Controller {
                 self.hide_removed_playlists(&mut playlists);
                 self.playlists = playlists;
                 self.ui.send(Event::Library(self.playlists_for_ui()));
+                self.send_link_playlists();
                 // Hidden from every list, so nothing else would show one still there.
                 self.delete_listed_links();
             }

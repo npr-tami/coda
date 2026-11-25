@@ -11,20 +11,44 @@ mod listpage;
 use std::sync::Arc;
 
 use egui::text::{LayoutJob, TextWrapping};
-use egui::{
-    Color32, CornerRadius, Galley, Id, Painter, Pos2, Rect,
-    RichText, Stroke, TextEdit, TextFormat, Ui, pos2, vec2,
-};
+use egui::{Color32, Galley, Id, Painter, Pos2, RichText, Stroke, TextEdit, TextFormat, Ui, vec2};
 
 use self::banner::banner_items;
-use super::dnd::SongsDrag;
 use super::fin;
-use super::kit;
-use super::theme::{Palette, bold};
-use super::util::{clean_description, fmt_song_count, fmt_thousands, mix};
+use super::theme::Palette;
+use super::util::{clean_description, fmt_thousands, mix};
 use super::{EditDetails, MiddleTab, CodaApp};
 use crate::model::{Command, Source, TrackInfo};
 use crate::text::{fold, push_fold};
+
+/// Puts `rows` (places in `tracks`, in the list's order) in `sort`'s order. Ties keep the list's
+/// order; names sort without minding capitals or accents.
+pub fn sort_rows(rows: &mut [u32], tracks: &[TrackInfo], sort: crate::config::ListSort) {
+    use crate::config::SortBy;
+    let t = |i: &u32| &tracks[*i as usize];
+    match sort.by {
+        SortBy::Own => {}
+        SortBy::Title => rows.sort_by_cached_key(|i| fold(&t(i).name)),
+        SortBy::Artist => rows.sort_by_cached_key(|i| (fold(&t(i).artist_line()), fold(&t(i).album))),
+        SortBy::Album => rows.sort_by_cached_key(|i| fold(&t(i).album)),
+        SortBy::Added => rows.sort_by_key(|i| std::cmp::Reverse(t(i).added_at)),
+        SortBy::Length => rows.sort_by_key(|i| t(i).duration_ms),
+    }
+    if sort.reverse {
+        rows.reverse();
+    }
+}
+
+/// The songs of a list in `sort`'s order (places in it), to play them that way; `None` in the list's
+/// own order.
+pub fn sorted_order(tracks: &[TrackInfo], sort: crate::config::ListSort) -> Option<Vec<usize>> {
+    if sort.is_own() {
+        return None;
+    }
+    let mut rows: Vec<u32> = (0..tracks.len() as u32).collect();
+    sort_rows(&mut rows, tracks, sort);
+    Some(rows.into_iter().map(|i| i as usize).collect())
+}
 
 /// The track list of the source shown in the centre.
 pub struct TrackView {
@@ -52,6 +76,8 @@ pub struct TrackView {
     /// 2 singles).
     pub show_all: bool,
     pub releases: u8,
+    /// How the songs are sorted (a view only: the list itself keeps its order).
+    pub sort: crate::config::ListSort,
     /// How the songs on screen last changed while they showed: rows close or open as songs go or
     /// come (see `follow`).
     pub moves: Option<Moves>,
@@ -129,6 +155,7 @@ impl TrackView {
             releases: 0,
             moves: None,
             last: None,
+            sort: crate::config::ListSort::default(),
         }
     }
 
@@ -173,6 +200,9 @@ impl TrackView {
                 .map(|(i, _)| i as u32)
                 .collect()
         };
+        if let Some(tracks) = self.tracks.as_ref() {
+            sort_rows(&mut self.filtered, tracks, self.sort);
+        }
     }
 
     /// Follows the `rows` shown in this `pass` (egui's count) from `tracks` and `blocked`: when songs
@@ -490,7 +520,7 @@ pub(super) fn playlist_face(known: Option<&crate::model::PlaylistSummary>, card:
     PlaylistFace { name: name.map(str::to_owned), owner: owner.to_owned(), image }
 }
 
-/// The owner in a playlist card's line: "Playlist · wisp" (search) or "By wisp" (a profile's).
+/// The owner in a playlist card's line: "Playlist · Mr J" (search) or "By Mr J" (a profile's).
 pub(super) fn card_owner(subtitle: &str) -> &str {
     let s = subtitle.trim();
     s.strip_prefix("Playlist · ").or_else(|| s.strip_prefix("By ")).map(str::trim).unwrap_or(if s == "Playlist" { "" } else { s })
@@ -535,10 +565,11 @@ pub(super) fn liked_color(p: &Palette) -> Color32 {
 }
 
 impl CodaApp {
-    /// A playlist's name, owner and cover: the library's, else the card it was seen on (see
-    /// `playlist_face`).
+    /// A playlist's name, owner and cover: the library's, else Spotify's answer for its page, else
+    /// the card it was seen on (see `playlist_face`).
     pub(super) fn playlist_face(&self, uri: &str) -> PlaylistFace {
-        playlist_face(self.playlist(uri), self.seen_playlists.get(uri))
+        let fresh = self.playlist_details.get(uri).and_then(|d| d.summary.as_ref());
+        playlist_face(self.playlist(uri).or(fresh), self.seen_playlists.get(uri))
     }
 
     fn header_info(&self, source: &Source) -> HeaderInfo {
@@ -584,15 +615,22 @@ impl CodaApp {
                 on_banner: false,
             },
             Source::Playlist(uri) => {
-                // In the library, else as the card it was opened from has it (one found by a search).
-                let known = self.playlist(uri);
+                // In the library, else as Spotify has it now (one found by a search, a link's),
+                // with the card it was opened from filling in what those don't have yet.
+                let fresh = self.playlist_details.get(uri).and_then(|d| d.summary.as_ref());
+                let known = self.playlist(uri).or(fresh);
+                let link = self.link_playlist(uri);
                 let face = self.playlist_face(uri);
                 HeaderInfo {
-                    kind: "Playlist",
-                    title: face.name.unwrap_or_else(|| "Playlist".to_owned()),
+                    kind: if link.is_some() { "Listen-along link" } else { "Playlist" },
+                    title: match link.and_then(|l| l.link.as_ref()) {
+                        Some((_, who)) => who.clone(),
+                        None if link.is_some() => "Listen-along link".to_owned(),
+                        None => face.name.unwrap_or_else(|| "Playlist".to_owned()),
+                    },
                     owner: face.owner,
                     image_url: face.image,
-                    editable_uri: known.filter(|p| p.editable).map(|p| p.uri.clone()),
+                    editable_uri: known.filter(|p| p.editable && link.is_none()).map(|p| p.uri.clone()),
                     round: false,
                     fallback_count: known.and_then(|p| p.track_count),
                     on_banner: false,
@@ -663,6 +701,37 @@ impl CodaApp {
         }
     }
 
+    /// Plays the open list's `source` from its page: unshuffled while it is sorted, in the order
+    /// shown (from `start`, else the first song shown); otherwise as the list has it. Shuffle is
+    /// the same either way.
+    pub(super) fn play_list(&mut self, source: &Source, start: Option<usize>, shuffle: bool) {
+        let order = self.view.as_ref().filter(|v| v.source == *source).and_then(|v| sorted_order(v.tracks.as_deref()?, v.sort));
+        match order {
+            Some(order) if !shuffle => self.send(Command::PlayInOrder { source: source.clone(), order, start_index: start }),
+            _ => self.send(Command::PlaySource { source: source.clone(), start_index: start, shuffle }),
+        }
+    }
+
+    /// Whether the open list `source` shows its songs sorted (not in its own order).
+    pub(super) fn list_sorted(&self, source: &Source) -> bool {
+        self.view.as_ref().is_some_and(|v| v.source == *source && !v.sort.is_own())
+    }
+
+    /// Sorts the open list's songs (a view only), remembered for that list.
+    pub(super) fn set_list_sort(&mut self, sort: crate::config::ListSort) {
+        let Some(view) = self.view.as_mut() else { return };
+        view.sort = sort;
+        view.refilter();
+        view.scroll_to_row = Some(0);
+        let key = view.source.cache_key();
+        if sort.is_own() {
+            self.prefs.list_sorts.remove(&key);
+        } else {
+            self.prefs.list_sorts.insert(key, sort);
+        }
+        self.prefs_changed();
+    }
+
     /// The chevron's "New round": every song in a fresh random order, as if none had been heard.
     fn new_round(&mut self, source: &Source) {
         self.send(Command::NewRound { source: source.clone() });
@@ -720,31 +789,6 @@ impl CodaApp {
         }
     }
 
-    /// While songs from the table are dragged: their name by the pointer.
-    pub(super) fn paint_songs_drag(&self, ui: &Ui, tracks: &[TrackInfo]) {
-        let p = self.palette;
-        let Some(drag) = egui::DragAndDrop::payload::<SongsDrag>(ui.ctx()) else { return };
-        // Songs dragged from elsewhere (the player bar) are drawn there.
-        if drag.uris.first().is_none_or(|first| !tracks.iter().any(|t| t.uri == *first)) {
-            return;
-        }
-        let Some(pointer) = ui.ctx().pointer_latest_pos() else { return };
-        let text = match drag.uris.as_slice() {
-            [uri] => tracks.iter().find(|t| t.uri == *uri).map_or_else(|| "1 song".to_owned(), |t| t.name.clone()),
-            uris => fmt_song_count(uris.len()),
-        };
-        let painter = ui.ctx().layer_painter(egui::LayerId::new(egui::Order::Tooltip, Id::new("songs_drag")));
-        let g = painter.layout_no_wrap(text, bold(12.0), p.text_strong);
-        let w = g.size().x.min(260.0);
-        let rect = Rect::from_min_size(pointer + vec2(14.0, 10.0), vec2(w + 38.0, 28.0));
-        painter.add(ui.visuals().popup_shadow.as_shape(rect, CornerRadius::same(kit::RADIUS)));
-        painter.rect_filled(rect, CornerRadius::same(kit::RADIUS), p.raised_bg);
-        painter.rect_stroke(rect, CornerRadius::same(kit::RADIUS), Stroke::new(1.0, p.accent.gamma_multiply(0.6)), egui::StrokeKind::Inside);
-        super::svgicon::paint(&painter, Rect::from_center_size(pos2(rect.left() + 15.0, rect.center().y), vec2(13.0, 13.0)), "note", p.accent_ink, super::svgicon::STROKE);
-        let clip = Rect::from_min_max(pos2(rect.left() + 28.0, rect.top()), pos2(rect.right() - 8.0, rect.bottom()));
-        painter.with_clip_rect(clip).galley(pos2(clip.left(), rect.center().y - g.size().y / 2.0), g, p.text_strong);
-    }
-
     pub(super) fn edit_details_modal(&mut self, ctx: &egui::Context) {
         let p = self.palette;
         let Some(edit) = self.edit_details.as_mut() else { return };
@@ -792,27 +836,78 @@ impl CodaApp {
 mod tests {
     use super::*;
 
-    fn night_card() -> crate::model::Card {
+    fn sortable(name: &str, artist: &str, album: &str, added_at: i64, secs: u32) -> TrackInfo {
+        TrackInfo {
+            uri: format!("spotify:track:{name}"),
+            name: name.into(),
+            artists: vec![crate::model::ArtistRef { name: artist.into(), uri: String::new() }],
+            album: album.into(),
+            album_uri: String::new(),
+            cover_small: None,
+            cover_large: None,
+            duration_ms: secs * 1000,
+            playable: true,
+            is_local: false,
+            added_at,
+        }
+    }
+
+    #[test]
+    fn songs_sort_by_each_column_and_the_filter_keeps_working() {
+        use crate::config::{ListSort, SortBy};
+        let list = Arc::new(vec![
+            sortable("beta", "Émile", "Zed", 30, 200),
+            sortable("Alpha", "carl", "yes", 10, 300),
+            sortable("gamma", "Ada", "Ace", 20, 100),
+        ]);
+        let mut v = TrackView::new(Source::LikedSongs);
+        v.set_tracks(list.clone());
+        let names = |v: &TrackView| v.filtered.iter().map(|&i| list[i as usize].name.clone()).collect::<Vec<_>>();
+        assert_eq!(names(&v), ["beta", "Alpha", "gamma"], "the list's own order");
+        for (by, want) in [
+            (SortBy::Title, ["Alpha", "beta", "gamma"]),
+            (SortBy::Artist, ["gamma", "Alpha", "beta"]),
+            (SortBy::Album, ["gamma", "Alpha", "beta"]),
+            (SortBy::Added, ["beta", "gamma", "Alpha"]),
+            (SortBy::Length, ["gamma", "beta", "Alpha"]),
+        ] {
+            v.sort = ListSort { by, reverse: false };
+            v.refilter();
+            assert_eq!(names(&v), want, "{by:?}");
+        }
+        v.sort = ListSort { by: SortBy::Title, reverse: true };
+        v.filter = "a".into();
+        v.refilter();
+        assert_eq!(names(&v), ["gamma", "beta", "Alpha"]);
+        v.filter = "ada".into();
+        v.refilter();
+        assert_eq!(names(&v), ["gamma"]);
+        // Played in that order; the own order plays as the list has it.
+        assert_eq!(sorted_order(&list, ListSort { by: SortBy::Title, reverse: false }), Some(vec![1, 0, 2]));
+        assert_eq!(sorted_order(&list, ListSort::default()), None);
+    }
+
+    fn jazz_card() -> crate::model::Card {
         crate::model::Card {
-            uri: "spotify:playlist:night".into(),
-            name: "Night drive radio".into(),
-            subtitle: "Playlist · wisp".into(),
-            image: Some("https://i.scdn.co/image/night".into()),
+            uri: "spotify:playlist:jazz".into(),
+            name: "Jazz 6 radio songs".into(),
+            subtitle: "Playlist · Mr J".into(),
+            image: Some("https://i.scdn.co/image/jazz".into()),
         }
     }
 
     #[test]
     fn a_playlist_opened_from_a_card_shows_the_cards_name_owner_and_cover() {
         // Nothing from the library or Spotify yet: all from the card that was clicked.
-        let face = playlist_face(None, Some(&night_card()));
-        assert_eq!(face, PlaylistFace { name: Some("Night drive radio".into()), owner: "wisp".into(), image: Some("https://i.scdn.co/image/night".into()) });
+        let face = playlist_face(None, Some(&jazz_card()));
+        assert_eq!(face, PlaylistFace { name: Some("Jazz 6 radio songs".into()), owner: "Mr J".into(), image: Some("https://i.scdn.co/image/jazz".into()) });
         // No card either: nothing known (the page says "Playlist").
         assert_eq!(playlist_face(None, None), PlaylistFace::default());
     }
 
     fn summary(name: &str, owner: &str, image: Option<&str>) -> crate::model::PlaylistSummary {
         crate::model::PlaylistSummary {
-            uri: "spotify:playlist:night".into(),
+            uri: "spotify:playlist:jazz".into(),
             name: name.into(),
             description: String::new(),
             owner_name: owner.into(),
@@ -827,22 +922,22 @@ mod tests {
 
     #[test]
     fn spotifys_own_answer_wins_and_the_card_fills_what_it_lacks() {
-        let known = summary("Night Drive FM", "wisp.", None);
-        let face = playlist_face(Some(&known), Some(&night_card()));
-        assert_eq!(face.name.as_deref(), Some("Night Drive FM"));
-        assert_eq!(face.owner, "wisp.");
+        let known = summary("Jazz VI Radio", "Mr J.", None);
+        let face = playlist_face(Some(&known), Some(&jazz_card()));
+        assert_eq!(face.name.as_deref(), Some("Jazz VI Radio"));
+        assert_eq!(face.owner, "Mr J.");
         // Spotify's header had no picture: the card's cover.
-        assert_eq!(face.image.as_deref(), Some("https://i.scdn.co/image/night"));
+        assert_eq!(face.image.as_deref(), Some("https://i.scdn.co/image/jazz"));
         // An empty name or owner in the answer doesn't blank the card's.
         let blank = summary("", " ", Some("https://i.scdn.co/image/own"));
-        let face = playlist_face(Some(&blank), Some(&night_card()));
-        assert_eq!(face, PlaylistFace { name: Some("Night drive radio".into()), owner: "wisp".into(), image: Some("https://i.scdn.co/image/own".into()) });
+        let face = playlist_face(Some(&blank), Some(&jazz_card()));
+        assert_eq!(face, PlaylistFace { name: Some("Jazz 6 radio songs".into()), owner: "Mr J".into(), image: Some("https://i.scdn.co/image/own".into()) });
     }
 
     #[test]
     fn the_owner_comes_out_of_a_cards_line() {
-        assert_eq!(card_owner("Playlist · wisp"), "wisp");
-        assert_eq!(card_owner("By wisp"), "wisp");
+        assert_eq!(card_owner("Playlist · Mr J"), "Mr J");
+        assert_eq!(card_owner("By Mr J"), "Mr J");
         assert_eq!(card_owner("Playlist"), "");
         assert_eq!(card_owner(""), "");
     }

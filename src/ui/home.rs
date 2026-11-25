@@ -237,6 +237,13 @@ impl CodaApp {
             let resp = ui.interact(rect, Id::new(("tile", &item.source)), Sense::click()).on_hover_cursor(CursorIcon::PointingHand);
             let on = self.playback.source.as_ref() == Some(&item.source);
             ui.painter().rect_filled(rect, CornerRadius::same(6), if resp.hovered() { p.hover_bg } else { p.raised_bg });
+            // One of the user's own playlists takes songs dropped on it, as in the sidebar.
+            if let Source::Playlist(uri) = &item.source
+                && self.playlist(uri).is_some_and(|pl| pl.editable)
+                && let Some(songs) = super::dnd::drop_on(ui, &resp, rect, &p)
+            {
+                self.add_dropped_songs(uri.clone(), songs.uris);
+            }
             let cover = Rect::from_min_size(rect.min, vec2(52.0, 52.0));
             self.home_cover(ui, cover, item, 6);
             let (sub, prog) = self.tile_progress(item, on);
@@ -604,7 +611,7 @@ impl CodaApp {
             });
             if r.days_ago <= 14 {
                 // The chrome NEW tag, 6 in from the corner.
-                let g = fin::spaced(ui, "NEW", bold(9.0), Color32::from_rgb(21, 23, 29), 0.8);
+                let g = fin::spaced(ui, "New", bold(10.0), Color32::from_rgb(21, 23, 29), 0.0);
                 let tag = Rect::from_min_size(lifted.min + vec2(6.0, 6.0), g.size() + vec2(10.0, 4.0));
                 ui.painter().add(egui::Shadow { offset: [0, 1], blur: 3, spread: 0, color: Color32::from_black_alpha(150) }.as_shape(tag, CornerRadius::same(3)));
                 fin::vgradient(ui.painter(), Rect::from_min_max(tag.min, pos2(tag.right(), tag.center().y)), Color32::from_rgb(248, 250, 253), Color32::from_rgb(199, 206, 219));
@@ -678,19 +685,17 @@ fn fit_shrink(room: f32, height: f32, covers: Covers) -> f32 {
     if scale >= 1.0 || scale < FIT_LEAST { 0.0 } else { 1.0 - scale }
 }
 
-/// A chip (`.chip`): 26 (or 24) tall, round, raised grey; on: the accent at 16 % with a 45 % ring. True
-/// when clicked.
+/// A chip (`.chip`): 26 (or 24) tall, round, as every chip row (Islands: the light fill with dark
+/// words when on, see [`fin::chip_fill`]). True when clicked.
 fn chip_at(ui: &Ui, p: &super::theme::Palette, rect: Rect, id: Id, g: std::sync::Arc<egui::Galley>, on: bool) -> bool {
     let resp = ui.interact(rect, id, Sense::click()).on_hover_cursor(CursorIcon::PointingHand);
     let r = (rect.height() / 2.0) as u8;
-    let fill = if on { fin::acc(p, 0.16) } else if resp.hovered() { p.widget_hover_bg } else { p.widget_bg };
+    let fill = motion::color(ui.ctx(), id.with("fill"), fin::chip_fill(p, on, resp.hovered() && !on), motion::HOVER);
+    let ink = motion::color(ui.ctx(), id.with("ink"), fin::chip_ink(p, on), motion::HOVER);
     ui.painter().rect_filled(rect, CornerRadius::same(r), fill);
-    if on {
-        ui.painter().rect_stroke(rect, CornerRadius::same(r), Stroke::new(1.0, fin::acc(p, 0.45)), StrokeKind::Inside);
-    }
     let gh = g.size().y;
     let gw = g.size().x;
-    ui.painter().galley_with_override_text_color(pos2(rect.center().x - gw / 2.0, rect.center().y - gh / 2.0), g, if on { p.text_strong } else { p.text });
+    ui.painter().galley_with_override_text_color(pos2(rect.center().x - gw / 2.0, rect.center().y - gh / 2.0), g, ink);
     resp.clicked()
 }
 

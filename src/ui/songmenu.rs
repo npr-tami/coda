@@ -199,7 +199,7 @@ impl CodaApp {
                 let open_sub = *item == Item::AddTo && m.sub;
                 let hot = resp.hovered() || open_sub;
                 if hot {
-                    ui.painter().rect_filled(row, CornerRadius::same(5), p.widget_hover_bg);
+                    ui.painter().rect_filled(row, CornerRadius::same(6), p.widget_hover_bg);
                 }
                 let (icon, label, key) = match item {
                     Item::AddTo => ("plus", "Add to playlist", ""),
@@ -262,7 +262,7 @@ impl CodaApp {
                 let row = Rect::from_min_size(pos2(sub.left() + PAD, iy), vec2(SUB_W - PAD * 2.0, ITEM_H));
                 let resp = ui.interact(row, Id::new("song-menu-new"), Sense::click()).on_hover_cursor(CursorIcon::PointingHand);
                 if resp.hovered() {
-                    ui.painter().rect_filled(row, CornerRadius::same(5), p.widget_hover_bg);
+                    ui.painter().rect_filled(row, CornerRadius::same(6), p.widget_hover_bg);
                 }
                 svgicon::paint(ui.painter(), Rect::from_min_size(pos2(row.left() + 10.0, row.center().y - 6.5), vec2(13.0, 13.0)), "plus", p.text_weak, svgicon::STROKE);
                 ui.painter().text(pos2(row.left() + 33.0, row.center().y), Align2::LEFT_CENTER, "New playlist…", regular(12.0), p.text);
@@ -284,7 +284,7 @@ impl CodaApp {
                     for (source, name, image, has, can) in &playlists {
                         let (r, resp) = ui.allocate_exact_size(vec2(list.width(), ITEM_H), if *can { Sense::click() } else { Sense::hover() });
                         if resp.hovered() && *can {
-                            ui.painter().rect_filled(r, CornerRadius::same(5), p.widget_hover_bg);
+                            ui.painter().rect_filled(r, CornerRadius::same(6), p.widget_hover_bg);
                         }
                         let pic = Rect::from_min_size(pos2(r.left() + 8.0, r.center().y - 9.0), vec2(18.0, 18.0));
                         if *source == Source::LikedSongs {
@@ -556,9 +556,9 @@ fn key_songs(view: Option<&super::tracks::TrackView>, playing: Option<&TrackInfo
 fn paint_box(ui: &Ui, rect: Rect) {
     let p = crate::ui::theme::palette(ui.ctx());
     let shadow = Shadow { offset: [0, 16], blur: 44, spread: 0, color: Color32::from_black_alpha(166) };
-    ui.painter().add(shadow.as_shape(rect, CornerRadius::same(8)));
-    ui.painter().rect_filled(rect, CornerRadius::same(8), p.raised_bg);
-    ui.painter().rect_stroke(rect, CornerRadius::same(8), Stroke::new(1.0, p.border), StrokeKind::Inside);
+    ui.painter().add(shadow.as_shape(rect, CornerRadius::same(10)));
+    ui.painter().rect_filled(rect, CornerRadius::same(10), p.raised_bg);
+    ui.painter().rect_stroke(rect, CornerRadius::same(10), Stroke::new(1.0, p.border), StrokeKind::Inside);
 }
 
 /// A song that can go in Liked Songs: a Spotify song, not a local file or an episode.

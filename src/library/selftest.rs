@@ -254,3 +254,29 @@ fn finish(r: Report) -> String {
     let head = if r.1 { "ALL PASSED" } else { "SOME FAILED" };
     format!("{head}\n{}", r.0)
 }
+
+/// Read-only: each playlist's likes both ways (Web API, when connected, and the owner's profile,
+/// the route a Coda without the Web API takes), to see where they differ.
+pub async fn playlist_likes(lib: Library, playlists: Vec<(String, String)>) -> String {
+    let session = lib.session();
+    let me = session.username();
+    let api = lib.webapi();
+    let mut out = format!("web api connected: {}\n", api.is_some());
+    for (uri, name) in playlists.into_iter().take(40) {
+        let Some(id) = convert::playlist_id(&uri) else { continue };
+        let owner = match fetch::playlist_header(&session, &id).await {
+            Ok(h) => super::draft_from_list(&super::normalized(&uri), &h, &me).owner,
+            Err(e) => {
+                let _ = writeln!(out, "{name}: header ERROR {e}");
+                continue;
+            }
+        };
+        let web = match &api {
+            Some(api) => format!("{:?}", api.playlist_followers(&uri).await.map_err(|e| e.to_string())),
+            None => "-".to_owned(),
+        };
+        let profile = Library::likes_from_profile(&session, &uri, &owner).await;
+        let _ = writeln!(out, "{name}: owner {:?}, web api {web}, profile {profile:?}", if owner == me { "me" } else if owner.is_empty() { "" } else { "other" });
+    }
+    out
+}

@@ -23,6 +23,15 @@ const MAX_FILE_BYTES: u64 = 200 * 1024 * 1024;
 /// Load an image file and produce JPEG bytes whose base64 encoding is <= 256 KB
 /// (square-crops to the centre, max 640x640, lowers quality until it fits).
 pub fn prepare_cover_jpeg(image_path: &Path) -> Result<Vec<u8>> {
+    let image = load_cover_picture(image_path)?;
+    let square = square_working_copy(&image)?;
+    drop(image);
+    fit_jpeg(&square)
+}
+
+/// Opens a picture the user picked for a cover (size checks, EXIF rotation applied), with the
+/// same plain errors as an upload.
+pub fn load_cover_picture(image_path: &Path) -> Result<DynamicImage> {
     let meta = std::fs::metadata(image_path).map_err(|e| {
         log::warn!("cover {}: {e}", image_path.display());
         anyhow!("coda couldn't open the picture \"{}\".", file_label(image_path))
@@ -33,10 +42,55 @@ pub fn prepare_cover_jpeg(image_path: &Path) -> Result<Vec<u8>> {
     if meta.len() > MAX_FILE_BYTES {
         bail!("That picture file is too large. Please choose one under 200 MB.");
     }
-    let image = decode(image_path)?;
-    let square = square_working_copy(&image)?;
-    drop(image);
-    fit_jpeg(&square)
+    decode(image_path)
+}
+
+/// The square the user chose in the crop step, as fractions of the picture, so it holds for the
+/// small preview and the full picture alike: `left` of the width, `top` of the height, `size` of
+/// the shorter side (1 = the largest square that fits).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CoverCrop {
+    pub left: f32,
+    pub top: f32,
+    pub size: f32,
+}
+
+impl CoverCrop {
+    /// The square in pixels of a `w` x `h` picture: (x, y, side), always inside it.
+    pub fn pixels(self, w: u32, h: u32) -> (u32, u32, u32) {
+        let short = w.min(h).max(1);
+        let side = ((self.size.clamp(0.0, 1.0) * short as f32).round() as u32).clamp(1, short);
+        let x = ((self.left.max(0.0) * w as f32).round() as u32).min(w.saturating_sub(side));
+        let y = ((self.top.max(0.0) * h as f32).round() as u32).min(h.saturating_sub(side));
+        (x, y, side)
+    }
+}
+
+/// A small copy of the picture for the crop step: flattened onto white as the upload will be,
+/// its longer side at most `max_side`.
+pub fn cover_preview(image: &DynamicImage, max_side: u32) -> RgbImage {
+    let (w, h) = (image.width(), image.height());
+    if w.max(h) > max_side {
+        flatten_to_rgb(image.thumbnail(max_side, max_side))
+    } else {
+        flatten_to_rgb(image.clone())
+    }
+}
+
+/// The chosen square of the picture, flattened onto white and at most twice the final size, ready
+/// to be saved and then uploaded (whose own centre crop then leaves it as it is).
+pub fn crop_cover(image: &DynamicImage, crop: CoverCrop) -> Result<RgbImage> {
+    if image.width() == 0 || image.height() == 0 {
+        bail!("That picture is empty.");
+    }
+    let (x, y, side) = crop.pixels(image.width(), image.height());
+    let rgb = flatten_to_rgb(image.crop_imm(x, y, side, side));
+    let max_working = MAX_SIDE * 2;
+    if side > max_working {
+        Ok(imageops::resize(&rgb, max_working, max_working, FilterType::Lanczos3))
+    } else {
+        Ok(rgb)
+    }
 }
 
 /// Base64 length (standard alphabet, padded) of `n` bytes.
@@ -218,6 +272,54 @@ mod tests {
         let square = square_working_copy(&DynamicImage::ImageRgb8(img)).unwrap();
         assert_eq!(square.dimensions(), (100, 100));
         assert!(square.pixels().all(|p| p[1] == 255 && p[0] == 0));
+    }
+
+    #[test]
+    fn crop_pixels_stay_inside_the_picture() {
+        let whole = CoverCrop { left: 0.0, top: 0.0, size: 1.0 };
+        assert_eq!(whole.pixels(300, 100), (0, 0, 100));
+        // Off the right edge: pulled back in.
+        assert_eq!(CoverCrop { left: 0.9, top: 0.0, size: 1.0 }.pixels(300, 100), (200, 0, 100));
+        // Half the short side, from the middle of a portrait picture.
+        assert_eq!(CoverCrop { left: 0.25, top: 0.375, size: 0.5 }.pixels(200, 400), (50, 150, 100));
+        // Nonsense values never give an empty or outside square.
+        assert_eq!(CoverCrop { left: -1.0, top: 5.0, size: 0.0 }.pixels(10, 10), (0, 9, 1));
+        assert_eq!(CoverCrop { left: 0.0, top: 0.0, size: 9.0 }.pixels(10, 20), (0, 0, 10));
+    }
+
+    #[test]
+    fn crop_cover_takes_the_chosen_square() {
+        // Green left third, red elsewhere: a crop at the left edge is all green.
+        let img = RgbImage::from_fn(300, 100, |x, _| if x < 100 { Rgb([0, 255, 0]) } else { Rgb([255, 0, 0]) });
+        let img = DynamicImage::ImageRgb8(img);
+        let left = crop_cover(&img, CoverCrop { left: 0.0, top: 0.0, size: 1.0 }).unwrap();
+        assert_eq!(left.dimensions(), (100, 100));
+        assert!(left.pixels().all(|p| p[1] == 255 && p[0] == 0));
+        // Zoomed in on the right end: all red, a quarter of the short side.
+        let right = crop_cover(&img, CoverCrop { left: 0.9, top: 0.5, size: 0.25 }).unwrap();
+        assert_eq!(right.dimensions(), (25, 25));
+        assert!(right.pixels().all(|p| p[0] == 255 && p[1] == 0));
+    }
+
+    #[test]
+    fn cropped_cover_uploads_unchanged() {
+        // What the crop step saves goes through the usual preparation as the same square.
+        let img = RgbImage::from_fn(900, 600, |x, y| Rgb([(x % 256) as u8, (y % 256) as u8, 40]));
+        let square = crop_cover(&DynamicImage::ImageRgb8(img), CoverCrop { left: 0.5, top: 0.1, size: 0.6 }).unwrap();
+        assert_eq!(square.dimensions(), (360, 360));
+        let file = TempFile::new("cropped.png");
+        square.save_with_format(&file.0, ImageFormat::Png).unwrap();
+        check_cover(&prepare_cover_jpeg(&file.0).unwrap(), 360);
+    }
+
+    #[test]
+    fn huge_crop_is_shrunk_and_preview_is_small() {
+        let img = DynamicImage::ImageRgb8(RgbImage::from_pixel(3000, 2000, Rgb([10, 20, 30])));
+        let square = crop_cover(&img, CoverCrop { left: 0.0, top: 0.0, size: 1.0 }).unwrap();
+        assert_eq!(square.dimensions(), (MAX_SIDE * 2, MAX_SIDE * 2));
+        let preview = cover_preview(&img, 800);
+        assert_eq!(preview.width(), 800);
+        assert!((533..=534).contains(&preview.height()), "{:?}", preview.dimensions());
     }
 
     #[test]

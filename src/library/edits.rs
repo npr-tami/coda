@@ -7,7 +7,7 @@ use std::collections::{HashMap, HashSet};
 use librespot_protocol::playlist4_external::op::Kind;
 use librespot_protocol::playlist4_external::{
     Add, ChangeInfo, Delta, Item, ItemAttributes, ListAttributeKind, ListAttributes, ListAttributesPartialState, ListChanges,
-    Op, Rem, UpdateListAttributes,
+    Mov, Op, Rem, UpdateListAttributes,
 };
 use protobuf::{EnumOrUnknown, MessageField};
 
@@ -193,6 +193,29 @@ pub fn take_rows(list: &mut Vec<Row>, rows: &[usize]) {
         !gone.contains(&(i - 1))
     });
 }
+/// The row at `from` (holding `uri`) moved so it ends at place `to`. Spotify's `to_index` counts
+/// places before the row is taken out, so moving down it is one further.
+pub fn move_one(from: usize, to: usize, uri: &str) -> Op {
+    let mut m = Mov::new();
+    m.set_from_index(from as i32);
+    m.set_length(1);
+    m.set_to_index(if to > from { to + 1 } else { to } as i32);
+    m.items.push(item(uri, None, None));
+    let mut o = op(Kind::MOV);
+    o.mov = MessageField::some(m);
+    o
+}
+
+/// `list` with the row at `from` moved to end at `to`.
+pub fn moved<T: Clone>(list: &[T], from: usize, to: usize) -> Vec<T> {
+    let mut v = list.to_vec();
+    if from < v.len() && to < v.len() {
+        let x = v.remove(from);
+        v.insert(to, x);
+    }
+    v
+}
+
 
 #[cfg(test)]
 mod tests {
@@ -201,6 +224,22 @@ mod tests {
 
     fn roundtrip(c: &ListChanges) -> ListChanges {
         ListChanges::parse_from_bytes(&c.write_to_bytes().expect("every required field set")).unwrap()
+    }
+
+    #[test]
+    fn a_moved_row_counts_its_target_as_spotify_does() {
+        let c = roundtrip(&changes("me", b"r", vec![move_one(1, 3, "spotify:track:b")], 7));
+        let o = &c.deltas[0].ops[0];
+        assert_eq!(o.kind(), Kind::MOV);
+        let m = &o.mov;
+        // Down: before the row now at 4 (b ends third of a c d b e).
+        assert_eq!((m.from_index(), m.length(), m.to_index()), (1, 1, 4));
+        assert_eq!(m.items[0].uri(), "spotify:track:b");
+        // Up: before the row at 0.
+        assert_eq!(move_one(3, 0, "x").mov.to_index(), 0);
+        assert_eq!(moved(&["a", "b", "c", "d", "e"], 1, 3), ["a", "c", "d", "b", "e"]);
+        assert_eq!(moved(&["a", "b", "c", "d", "e"], 3, 0), ["d", "a", "b", "c", "e"]);
+        assert_eq!(moved(&["a", "b"], 5, 0), ["a", "b"], "out of the list: as it was");
     }
 
     #[test]

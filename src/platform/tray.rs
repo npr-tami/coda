@@ -3,7 +3,7 @@
 
 use std::sync::Once;
 
-use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
+use tray_icon::menu::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem};
 use tray_icon::{MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
 
 use super::state::{NowPlaying, Status, now_playing_label, tray_tooltip};
@@ -17,6 +17,7 @@ const ID_NEXT: &str = "coda.next";
 const ID_PREVIOUS: &str = "coda.previous";
 const ID_SHOW: &str = "coda.show";
 const ID_MINI: &str = "coda.mini_player";
+const ID_HIDE_DISCORD: &str = "coda.hide_discord";
 const ID_QUIT: &str = "coda.quit";
 
 /// What a tray menu item does.
@@ -27,6 +28,7 @@ pub fn menu_action(id: &str) -> Option<PlatformAction> {
         ID_PREVIOUS => PlatformAction::Command(Command::Previous),
         ID_SHOW => PlatformAction::ShowWindow,
         ID_MINI => PlatformAction::ToggleMiniPlayer,
+        ID_HIDE_DISCORD => PlatformAction::ToggleHideDiscord,
         ID_QUIT => PlatformAction::Quit,
         _ => return None,
     })
@@ -83,6 +85,8 @@ pub struct Tray {
     icon: TrayIcon,
     now_playing: MenuItem,
     play_pause: MenuItem,
+    /// "Hide from Discord": greyed out while the Discord status is off.
+    hide_discord: CheckMenuItem,
     shown_label: String,
     shown_playing: bool,
     shown_tooltip: String,
@@ -98,6 +102,7 @@ impl Tray {
         let previous = MenuItem::with_id(ID_PREVIOUS, "Previous", true, None);
         let show = MenuItem::with_id(ID_SHOW, "Show coda", true, None);
         let mini = MenuItem::with_id(ID_MINI, "Mini player", true, None);
+        let hide_discord = CheckMenuItem::with_id(ID_HIDE_DISCORD, "Hide from Discord", false, false, None);
         let quit = MenuItem::with_id(ID_QUIT, "Quit", true, None);
         let menu = Menu::new();
         menu.append_items(&[
@@ -108,6 +113,8 @@ impl Tray {
             &PredefinedMenuItem::separator(),
             &show,
             &mini,
+            &PredefinedMenuItem::separator(),
+            &hide_discord,
             &PredefinedMenuItem::separator(),
             &quit,
         ])
@@ -128,6 +135,7 @@ impl Tray {
             icon,
             now_playing,
             play_pause,
+            hide_discord,
             shown_label: now_playing_label(None, Status::Stopped),
             shown_playing: false,
             shown_tooltip: tooltip,
@@ -139,6 +147,12 @@ impl Tray {
         if let Err(e) = tray_image(style).and_then(|image| self.icon.set_icon(Some(image)).map_err(|e| e.to_string())) {
             log::warn!("tray: could not change the icon: {e}");
         }
+    }
+
+    /// The "Hide from Discord" item: usable while the Discord status is on, ticked while hidden.
+    pub fn set_discord(&mut self, on: bool, hidden: bool) {
+        self.hide_discord.set_enabled(on);
+        self.hide_discord.set_checked(hidden);
     }
 
     /// Refresh the tooltip and menu; only touches what actually changed.
@@ -177,6 +191,7 @@ mod tests {
         assert!(matches!(menu_action(ID_PREVIOUS), Some(PlatformAction::Command(Command::Previous))));
         assert!(matches!(menu_action(ID_SHOW), Some(PlatformAction::ShowWindow)));
         assert!(matches!(menu_action(ID_MINI), Some(PlatformAction::ToggleMiniPlayer)));
+        assert!(matches!(menu_action(ID_HIDE_DISCORD), Some(PlatformAction::ToggleHideDiscord)));
         assert!(matches!(menu_action(ID_QUIT), Some(PlatformAction::Quit)));
         assert!(menu_action(ID_NOW_PLAYING).is_none());
         assert!(menu_action("something else").is_none());

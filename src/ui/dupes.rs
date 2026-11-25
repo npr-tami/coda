@@ -340,7 +340,7 @@ fn copy_row(ui: &Ui, p: &Palette, rect: Rect, c: &CopyRow) -> bool {
         None
     };
     if let Some((word, color)) = label {
-        let g = fin::spaced(ui, &word.to_uppercase(), bold(10.0), color, 0.6);
+        let g = fin::spaced(ui, word, super::theme::medium(11.5), color, 0.0);
         painter.galley(pos2(right - g.size().x, mid - g.size().y / 2.0), g, color);
     }
     right -= LABEL_W + GAP;

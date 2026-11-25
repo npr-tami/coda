@@ -364,6 +364,61 @@ impl Library {
         bail!("The playlist changed while saving. Please try again.")
     }
 
+    /// Moves the song at place `from` of one of the user's playlists to place `to` (where it then
+    /// is), `before` being the playlist as shown. Only when Spotify's playlist is still that (else
+    /// the place could be another song's); the saved copy then has the new order.
+    pub async fn move_song(&self, uri: &str, before: &[TrackInfo], from: usize, to: usize) -> Result<()> {
+        if from >= before.len() || to >= before.len() || from == to {
+            return Ok(());
+        }
+        let id = playlist_spotify_id(uri)?;
+        let session = self.session();
+        let user = require_username(&session)?;
+        let _turn = self.inner.write_gate.lock().await;
+        let endpoint = fetch::playlist_changes_endpoint(&id).map_err(|e| anyhow!("{e}"))?;
+        let was: Vec<edits::Row> = before.iter().map(|t| (t.uri.clone(), t.added_at)).collect();
+        let want = edits::moved(&was, from, to);
+        for attempt in 0..2 {
+            let (revision, now) = playlist_rows(&session, &id).await?;
+            if now != was {
+                bail!("The playlist changed on Spotify. Reload it and try again.");
+            }
+            let changes = edits::changes(&user, &revision, vec![edits::move_one(from, to, &was[from].0)], edits::now_ms());
+            match fetch::post_list_changes(&session, &endpoint, &changes).await {
+                Sent::Applied(reply) => {
+                    self.keep_moved(uri, before, from, to, fetch::revision_of(&reply));
+                    return Ok(());
+                }
+                Sent::Conflict if attempt == 0 => continue,
+                Sent::Conflict => break,
+                Sent::Refused(e) => return Err(friendly("Couldn't move the song.", e, &session)),
+                Sent::Unsure(e) => {
+                    log::warn!("moving a song: no clear answer ({e}); checking");
+                    tokio::time::sleep(CHECK_AFTER).await;
+                    if playlist_rows(&session, &id).await.is_ok_and(|(_, now)| now == want) {
+                        self.keep_moved(uri, before, from, to, None);
+                        return Ok(());
+                    }
+                    bail!("Spotify didn't confirm the change. Check the playlist before trying again.");
+                }
+            }
+        }
+        bail!(LIST_CHANGED)
+    }
+
+    /// The saved copy of a playlist after a song moved in it: its new order, at Spotify's new
+    /// revision (unknown: read again next time it opens).
+    fn keep_moved(&self, uri: &str, before: &[TrackInfo], from: usize, to: usize, revision: Option<Vec<u8>>) {
+        let source = crate::model::Source::Playlist(uri.to_owned());
+        let Some(entry) = self.cached_entry(&source) else { return };
+        let tracks = Arc::new(edits::moved(before, from, to));
+        let revision = revision.map(|r| convert::hex(&r)).unwrap_or_default();
+        if revision.is_empty() {
+            lock(&self.inner.state).revisions.remove(&normalized(uri));
+        }
+        self.store(&source, revision, entry.sync_token, entry.username, tracks);
+    }
+
     /// Takes rows out of a playlist by place (one copy of a song in it twice, not every copy):
     /// `before` is the playlist as it was read, `rows` places in it. Only those rows go. If the
     /// playlist changed since, each row is found again as its song's same copy; when that can't be
@@ -597,6 +652,49 @@ impl Library {
     /// Spotify keeps it 90 days to recover).
     pub async fn remove_playlist(&self, uri: &str) -> Result<()> {
         self.unlist_playlist(uri, false).await
+    }
+
+    /// Puts someone else's playlist first in the library list (Spotify's "Add to Your Library",
+    /// following it): the same list `remove_playlist` takes playlists out of. Nothing changes if it
+    /// is in there already.
+    pub async fn add_playlist(&self, uri: &str) -> Result<()> {
+        let target = convert::normalize_playlist_uri(uri).ok_or_else(|| anyhow!("That isn't a Spotify playlist."))?;
+        let session = self.session();
+        let user = require_username(&session)?;
+        let _turn = self.inner.write_gate.lock().await;
+        let endpoint = fetch::rootlist_changes_endpoint(&session);
+        let listed = |list: &[String]| list.iter().any(|u| convert::normalize_playlist_uri(u).as_deref() == Some(target.as_str()));
+        for attempt in 0..2 {
+            let (revision, list) = fetch::rootlist_raw(&session).await.map_err(|e| friendly("Couldn't read your library.", e, &session))?;
+            if listed(&list) {
+                return Ok(());
+            }
+            let now = edits::now_ms();
+            let add = edits::changes(&user, &revision, vec![edits::add_first(&target, now, false)], now);
+            match fetch::post_list_changes(&session, &endpoint, &add).await {
+                Sent::Applied(_) => return Ok(()),
+                Sent::Conflict if attempt == 0 => continue,
+                Sent::Conflict => break,
+                Sent::Refused(e) => {
+                    if web_api_may_help(&e)
+                        && let Some(api) = self.webapi()
+                    {
+                        log::warn!("adding a playlist through the session was refused ({e}); using the Web API");
+                        return api.add_playlist(&target).await;
+                    }
+                    return Err(friendly("Couldn't add the playlist.", e, &session));
+                }
+                Sent::Unsure(e) => {
+                    log::warn!("adding {target} to the library: no clear answer ({e}); checking");
+                    tokio::time::sleep(CHECK_AFTER).await;
+                    if fetch::rootlist_raw(&session).await.is_ok_and(|(_, list)| listed(&list)) {
+                        return Ok(());
+                    }
+                    bail!("Spotify didn't confirm the change. Check your library before trying again.");
+                }
+            }
+        }
+        bail!("Your library changed while saving. Please try again.")
     }
 
     /// Takes a removed listen-along link's playlist out of the library list, without naming it in

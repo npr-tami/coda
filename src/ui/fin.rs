@@ -41,8 +41,8 @@ pub fn row_ink(p: &Palette, dim: bool, current: bool) -> (Color32, Color32) {
 /// no accent bar. The accent is kept for what plays (the record, the playing marks).
 pub fn paint_chosen(painter: &egui::Painter, p: &Palette, rect: Rect) {
     let edge = if p.dark { Color32::from_white_alpha(14) } else { p.border };
-    painter.rect_filled(rect, CornerRadius::same(6), p.chosen_bg);
-    painter.rect_stroke(rect, CornerRadius::same(6), Stroke::new(1.0, edge), StrokeKind::Inside);
+    painter.rect_filled(rect, CornerRadius::same(8), p.chosen_bg);
+    painter.rect_stroke(rect, CornerRadius::same(8), Stroke::new(1.0, edge), StrokeKind::Inside);
 }
 
 /// How an icon button looks besides hover: `.on` (accent), `.onb` (accent on a raised square), `.sel`
@@ -57,6 +57,10 @@ pub enum Look {
     Dim,
     /// Its menu is open (`.ib.open`): drawn as if hovered.
     Open,
+    /// A round grey button beside text buttons (a hero's pin, edit and More), and the same picked
+    /// (the icon in the accent).
+    Pill,
+    PillOn,
 }
 
 impl Look {
@@ -66,6 +70,10 @@ impl Look {
 
     pub fn on_box(on: bool) -> Self {
         if on { Self::OnBox } else { Self::Plain }
+    }
+
+    pub fn pill(on: bool) -> Self {
+        if on { Self::PillOn } else { Self::Pill }
     }
 }
 
@@ -102,8 +110,12 @@ fn ib_with(ui: &Ui, p: &Palette, rect: Rect, id: Id, look: Look, tip: &str, icon
     let sense = if look == Look::Dim { Sense::hover() } else { Sense::click() };
     let resp = ui.interact(rect, id, sense);
     let hovered = resp.hovered() && look != Look::Dim;
-    let round = CornerRadius::same(6);
+    let pill = matches!(look, Look::Pill | Look::PillOn);
+    let round = if pill { CornerRadius::same((rect.height().min(rect.width()) / 2.0) as u8) } else { CornerRadius::same(8) };
+    let pill_bg = if hovered { p.widget_hover_bg } else { p.widget_bg };
     let (fg, bg) = match look {
+        Look::Pill => (if hovered { p.text_strong } else { p.text }, Some(pill_bg)),
+        Look::PillOn => (p.accent_ink, Some(pill_bg)),
         Look::Dim => (p.text_faint, None),
         Look::On => (p.accent_ink, hovered.then_some(p.hover_bg)),
         Look::OnBox => (p.accent_ink, Some(p.widget_hover_bg)),
@@ -123,7 +135,7 @@ fn ib_with(ui: &Ui, p: &Palette, rect: Rect, id: Id, look: Look, tip: &str, icon
         }
         if sel > 0.0 {
             let bar = Rect::from_min_size(rect.min, vec2(3.0, rect.height()));
-            painter.rect_filled(bar, CornerRadius { nw: 6, sw: 6, ne: 0, se: 0 }, p.accent_ink.gamma_multiply(sel));
+            painter.rect_filled(bar, CornerRadius { nw: 8, sw: 8, ne: 0, se: 0 }, p.accent_ink.gamma_multiply(sel));
         }
         icon(painter, fg);
     });
@@ -193,7 +205,7 @@ pub fn let_go(ctx: &egui::Context, id: Id) {
 fn line_with(ui: &Ui, p: &Palette, rect: Rect, id: Id, value: f32, enabled: bool, grab_knob: bool) -> (Response, Option<f32>) {
     let sense = if enabled { Sense::click_and_drag() } else { Sense::hover() };
     let resp = ui.interact(rect, id, sense);
-    let bar = Rect::from_center_size(rect.center(), vec2(rect.width(), 3.0));
+    let bar = Rect::from_center_size(rect.center(), vec2(rect.width(), 4.0));
     let painter = ui.painter();
     painter.rect_filled(bar, CornerRadius::same(2), p.border);
     // Only the left button moves it (the right one is for menus, such as the volume's box).
@@ -243,8 +255,9 @@ pub struct SearchBox {
     pub resp: Response,
 }
 
-/// The search box (`.srch`) at `rect` (30 tall): a 13 px magnifier, the text, and a key hint such as
-/// "Ctrl+K" on the right (an × to clear when there is text). Its border turns accent while focused.
+/// The search box (`.srch`) at `rect` (30 tall): a borderless pill on a raised fill (Islands), a 13 px
+/// magnifier, the text, and a key hint such as "Ctrl+K" on the right (an × to clear when there is
+/// text). An accent ring shows while it is focused.
 #[allow(clippy::too_many_arguments)]
 pub fn search_box(ui: &mut Ui, p: &Palette, rect: Rect, id: Id, text: &mut String, hint: &str, key: &str) -> SearchBox {
     search_box_with(ui, p, rect, id, text, hint, key, "search")
@@ -257,26 +270,31 @@ pub fn search_box_with(ui: &mut Ui, p: &Palette, rect: Rect, id: Id, text: &mut 
     let whole = ui.interact(rect, id.with("box"), Sense::click()).on_hover_cursor(CursorIcon::Text);
     let focused = ui.memory(|m| m.has_focus(id));
     let painter = ui.painter().clone();
-    painter.rect_filled(rect, CornerRadius::same(6), p.field_bg);
-    let border = motion::color(ui.ctx(), id.with("border"), if focused { p.accent_ink } else { p.field_border }, motion::HOVER);
-    painter.rect_stroke(rect, CornerRadius::same(6), Stroke::new(1.0, border), StrokeKind::Inside);
-    let icon = Rect::from_min_size(pos2(rect.left() + 10.0, rect.center().y - 6.5), vec2(13.0, 13.0));
+    let round = CornerRadius::same((rect.height() / 2.0).min(127.0) as u8);
+    let fill = if whole.hovered() && !focused { p.widget_hover_bg } else { p.widget_bg };
+    painter.rect_filled(rect, round, motion::color(ui.ctx(), id.with("fill"), fill, motion::HOVER));
+    let border = motion::color(ui.ctx(), id.with("border"), if focused { p.accent_ink } else { Color32::TRANSPARENT }, motion::HOVER);
+    if border.a() > 0 {
+        painter.rect_stroke(rect, round, Stroke::new(1.0, border), StrokeKind::Inside);
+    }
+    let pad = (rect.height() / 2.0).clamp(10.0, 14.0);
+    let icon = Rect::from_min_size(pos2(rect.left() + pad, rect.center().y - 6.5), vec2(13.0, 13.0));
     svgicon::paint(&painter, icon, glyph, motion::color(ui.ctx(), id.with("glyph"), if focused { p.text_strong } else { p.text_weak }, motion::HOVER), STROKE);
 
     let mut cleared = false;
     let right = if text.is_empty() {
         if key.is_empty() {
-            rect.right() - 8.0
+            rect.right() - pad
         } else {
             let g = ui.fonts_mut(|f| f.layout_no_wrap(key.to_owned(), regular(10.0), p.text_weak));
             let kw = g.size().x + 10.0;
-            let kr = Rect::from_min_size(pos2(rect.right() - 8.0 - kw, rect.center().y - 8.0), vec2(kw, 16.0));
-            painter.rect_stroke(kr, CornerRadius::same(4), Stroke::new(1.0, p.border), StrokeKind::Inside);
+            let kr = Rect::from_min_size(pos2(rect.right() - pad + 3.0 - kw, rect.center().y - 8.0), vec2(kw, 16.0));
+            painter.rect_stroke(kr, CornerRadius::same(8), Stroke::new(1.0, p.widget_hover_bg), StrokeKind::Inside);
             painter.galley(pos2(kr.left() + 5.0, kr.center().y - g.size().y / 2.0), g, p.text_weak);
             kr.left()
         }
     } else {
-        let xr = Rect::from_min_size(pos2(rect.right() - 8.0 - 13.0, rect.center().y - 6.5), vec2(13.0, 13.0));
+        let xr = Rect::from_min_size(pos2(rect.right() - pad - 13.0, rect.center().y - 6.5), vec2(13.0, 13.0));
         let xresp = ui.interact(xr.expand(3.0), id.with("x"), Sense::click()).on_hover_cursor(CursorIcon::PointingHand);
         svgicon::paint(&painter, xr, "x", motion::color(ui.ctx(), xresp.id, if xresp.hovered() { p.text_strong } else { p.text_weak }, motion::HOVER), STROKE);
         if xresp.on_hover_text("Clear").clicked() {
@@ -535,14 +553,13 @@ pub fn switch(ui: &Ui, p: &Palette, rect: Rect, id: Id, on: bool, enabled: bool,
     resp.clicked()
 }
 
-/// A text button (`.b`): 28 tall, 14 either side, round 6, 11 px semibold capitals spaced .05em, an
+/// A text button (`.b`): 28 tall, 14 either side, a pill (Islands), 12 px semibold words as written, an
 /// optional 13 px icon 7 before the text. `primary` fills it with the accent. Returns its response.
 #[allow(clippy::too_many_arguments)]
 pub fn text_button(ui: &Ui, p: &Palette, at: egui::Pos2, id: Id, text: &str, icon: Option<&str>, primary: bool, enabled: bool) -> Response {
-    let label = text.to_uppercase();
     let color = if !enabled { p.text_faint } else if primary { p.on_accent } else { p.text };
     let color = motion::color(ui.ctx(), id.with("text"), color, motion::HOVER);
-    let g = spaced(ui, &label, super::theme::bold(11.0), Color32::PLACEHOLDER, 0.55);
+    let g = button_label(ui, text);
     let icon_w = if icon.is_some() { 13.0 + 7.0 } else { 0.0 };
     let w = 14.0 + icon_w + g.size().x + 14.0;
     let rect = Rect::from_min_size(at, vec2(w, 28.0));
@@ -559,7 +576,7 @@ pub fn text_button(ui: &Ui, p: &Palette, at: egui::Pos2, id: Id, text: &str, ico
     let scale = motion::press(ui.ctx(), id, enabled && resp.is_pointer_button_down_on());
     motion::scaled(ui, rect.center(), scale, || {
         let painter = ui.painter();
-        painter.rect_filled(rect, CornerRadius::same(6), fill);
+        painter.rect_filled(rect, CornerRadius::same(14), fill);
         let mut x = rect.left() + 14.0;
         if let Some(icon) = icon {
             svgicon::paint(painter, Rect::from_min_size(pos2(x, rect.center().y - 6.5), vec2(13.0, 13.0)), icon, color, STROKE);
@@ -656,23 +673,20 @@ pub fn hfade_line(painter: &egui::Painter, x: std::ops::RangeInclusive<f32>, y: 
 }
 
 /// A chip (`.chip`): 26 tall (24 `small`), 12 either side (10), round, 11.5 px medium (11), an optional
-/// 13 px icon 7 before the text; `on`: the accent tint with a ring. Placed with its left at `at.x`,
-/// centred on `at.y`.
+/// 13 px icon 7 before the text; `on`: a light fill with dark words (Islands, see
+/// [`Palette::chip_on_bg`]). Placed with its left at `at.x`, centred on `at.y`.
 #[allow(clippy::too_many_arguments)]
 pub fn chip(ui: &Ui, p: &Palette, at: egui::Pos2, id: Id, text: &str, icon: Option<&str>, on: bool, small: bool) -> Response {
     let (h, pad, size) = if small { (24.0, 10.0, 11.0) } else { (26.0, 12.0, 11.5) };
-    let color = if on { p.text_strong } else { p.text };
-    let g = ui.painter().layout_no_wrap(text.to_owned(), super::theme::medium(size), color);
+    let g = ui.painter().layout_no_wrap(text.to_owned(), super::theme::medium(size), Color32::PLACEHOLDER);
     let icon_w = if icon.is_some() { 13.0 + 7.0 } else { 0.0 };
     let rect = Rect::from_min_size(pos2(at.x, at.y - h / 2.0), vec2(pad + icon_w + g.size().x + pad, h));
     let resp = ui.interact(rect, id, Sense::click()).on_hover_cursor(CursorIcon::PointingHand);
     let r = CornerRadius::same((h / 2.0) as u8);
-    let fill = motion::color(ui.ctx(), id.with("fill"), if on { acc(p, 0.16) } else if resp.hovered() { p.widget_hover_bg } else { p.widget_bg }, motion::HOVER);
+    let fill = motion::color(ui.ctx(), id.with("fill"), chip_fill(p, on, resp.hovered()), motion::HOVER);
+    let color = motion::color(ui.ctx(), id.with("ink"), chip_ink(p, on), motion::HOVER);
     let painter = ui.painter();
     painter.rect_filled(rect, r, fill);
-    if on {
-        painter.rect_stroke(rect, r, Stroke::new(1.0, acc(p, 0.45)), StrokeKind::Inside);
-    }
     let mut x = rect.left() + pad;
     if let Some(icon) = icon {
         svgicon::paint(painter, Rect::from_min_size(pos2(x, rect.center().y - 6.5), vec2(13.0, 13.0)), icon, color, STROKE);
@@ -680,6 +694,112 @@ pub fn chip(ui: &Ui, p: &Palette, at: egui::Pos2, id: Id, text: &str, icon: Opti
     }
     painter.galley(pos2(x, rect.center().y - g.size().y / 2.0), g, color);
     resp
+}
+
+/// A chip's fill (Islands): picked, the light fill; else the raised grey, a step up on hover.
+pub fn chip_fill(p: &Palette, on: bool, hovered: bool) -> Color32 {
+    if on {
+        p.chip_on_bg()
+    } else if hovered {
+        p.widget_hover_bg
+    } else {
+        p.widget_bg
+    }
+}
+
+/// A chip's words: dark on the picked one's light fill, else the text colour.
+pub fn chip_ink(p: &Palette, on: bool) -> Color32 {
+    if on { p.chip_on_ink() } else { p.text }
+}
+
+/// A chip's small count beside its words: a little softer than them.
+pub fn chip_count_ink(p: &Palette, on: bool) -> Color32 {
+    if on { p.chip_on_ink().gamma_multiply(0.62) } else { p.text_weak }
+}
+
+/// A chip in a row of tabs (Songs / Blocked, Lyrics / Up next / Rules / Friends): where it is, its
+/// response, the room before its words, and the colours its words and count take.
+pub struct TabChip {
+    pub rect: Rect,
+    pub resp: Response,
+    pub pad: f32,
+    pub ink: Color32,
+    pub count_ink: Color32,
+}
+
+/// A tab chip's height, the room either side of its words (at most and at least, when the row is
+/// short of room), and the gap between chips.
+pub const TAB_CHIP_H: f32 = 28.0;
+pub const TAB_CHIP_PAD: f32 = 12.0;
+const TAB_CHIP_PAD_LEAST: f32 = 6.0;
+const TAB_CHIP_GAP: f32 = 6.0;
+
+/// A tab chip's words: 12 px medium, the same picked or not (so the row keeps its width).
+pub fn tab_chip_font() -> egui::FontId {
+    super::theme::medium(12.0)
+}
+
+/// The room either side of the words and between the chips of a row of chips `widths` wide inside,
+/// to fit `room` (less room for both, down to a least).
+fn tab_chip_spacing(widths: &[f32], room: f32) -> (f32, f32) {
+    let n = widths.len().max(1) as f32;
+    let words: f32 = widths.iter().sum();
+    let full = words + n * 2.0 * TAB_CHIP_PAD + (n - 1.0) * TAB_CHIP_GAP;
+    if full <= room {
+        return (TAB_CHIP_PAD, TAB_CHIP_GAP);
+    }
+    let gap = 4.0;
+    let pad = ((room - words - (n - 1.0) * gap) / (2.0 * n)).clamp(TAB_CHIP_PAD_LEAST, TAB_CHIP_PAD);
+    (pad, gap)
+}
+
+/// A row of tabs as chips (Islands), left to right from `left` within `room`, centred on `cy`: each
+/// `widths[k]` wide inside (its words and count), the light fill on the one `chosen`, sliding there
+/// when another is picked. Draws the fills only; the caller draws each chip's words in its `ink`.
+#[allow(clippy::too_many_arguments)]
+pub fn tab_chips(ui: &Ui, p: &Palette, id: Id, left: f32, cy: f32, room: f32, widths: &[f32], chosen: Option<usize>) -> Vec<TabChip> {
+    let (pad, gap) = tab_chip_spacing(widths, room);
+    let mut x = left;
+    let rects: Vec<Rect> = widths
+        .iter()
+        .map(|&w| {
+            let r = Rect::from_min_size(pos2(x, cy - TAB_CHIP_H / 2.0), vec2(w + 2.0 * pad, TAB_CHIP_H));
+            x = r.right() + gap;
+            r
+        })
+        .collect();
+    let round = CornerRadius::same((TAB_CHIP_H / 2.0) as u8);
+    let painter = ui.painter();
+    let out: Vec<TabChip> = rects
+        .iter()
+        .enumerate()
+        .map(|(k, &rect)| {
+            let resp = ui.interact(rect, id.with(("chip", k)), Sense::click()).on_hover_cursor(CursorIcon::PointingHand);
+            let on = chosen == Some(k);
+            let fill = motion::color(ui.ctx(), resp.id.with("fill"), chip_fill(p, false, resp.hovered() && !on), motion::HOVER);
+            painter.rect_filled(rect, round, fill);
+            let ink = motion::color(ui.ctx(), resp.id.with("ink"), chip_ink(p, on), motion::TAB);
+            let count_ink = motion::color(ui.ctx(), resp.id.with("count"), chip_count_ink(p, on), motion::TAB);
+            TabChip { rect, resp, pad, ink, count_ink }
+        })
+        .collect();
+    // The light fill slides to the chip picked.
+    motion::marker(ui.ctx(), id.with("marker"), pos2(left, cy), chosen.map(|k| (k, rects[k])), motion::TAB, |r, a| {
+        painter.rect_filled(r, round, p.chip_on_bg().gamma_multiply(a));
+    });
+    out
+}
+
+/// How wide [`tab_chips`] draws chips `widths` wide inside, given all the room they want.
+pub fn tab_chips_w(widths: &[f32]) -> f32 {
+    let n = widths.len() as f32;
+    widths.iter().sum::<f32>() + n * 2.0 * TAB_CHIP_PAD + (n - 1.0).max(0.0) * TAB_CHIP_GAP
+}
+
+/// How wide [`tab_chips`] draws them at the least.
+pub fn tab_chips_least_w(widths: &[f32]) -> f32 {
+    let n = widths.len() as f32;
+    widths.iter().sum::<f32>() + n * 2.0 * TAB_CHIP_PAD_LEAST + (n - 1.0).max(0.0) * 4.0
 }
 
 /// How wide `chip` draws `text` without an icon.
@@ -806,9 +926,14 @@ pub fn field_label(ui: &mut Ui, text: &str) {
     ui.add_space(4.0);
 }
 
+/// A button's words: 12 px semibold, as written ("Pause", not PAUSE: size and weight carry it).
+pub fn button_label(ui: &Ui, text: &str) -> std::sync::Arc<egui::Galley> {
+    spaced(ui, text, super::theme::bold(12.0), Color32::PLACEHOLDER, 0.0)
+}
+
 /// How wide `text_button` draws `text`.
 pub fn text_button_w(ui: &Ui, text: &str, icon: bool) -> f32 {
-    let g = spaced(ui, &text.to_uppercase(), super::theme::bold(11.0), Color32::PLACEHOLDER, 0.55);
+    let g = button_label(ui, text);
     14.0 + if icon { 20.0 } else { 0.0 } + g.size().x + 14.0
 }
 

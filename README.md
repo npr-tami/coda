@@ -5,13 +5,15 @@ written in Rust, with no embedded browser.
 
 [Download coda.exe](https://github.com/npr-tami/coda/releases/latest) · [What's new](CHANGELOG.md)
 
+0.1.5 is the last public release. This repository is archived and gets no more updates.
+
 ## Features
 
 - Your playlists, Liked Songs, albums, artists and search, with likes and fast filtering.
 - Shuffle where every order is equally likely, with optional rules: play every song before
   repeating, avoid the same artist twice in a row, favour songs you rarely play, skip songs
   you blocked.
-- Finding duplicates in your own playlists.
+- Sorting, drag and drop for Up next and your own playlists, and finding duplicates.
 - Media keys, the Windows media overlay, a tray icon, a mini player and start with Windows.
 - Equalizer, crossfade and a sleep timer.
 - Listen along with friends through a link.

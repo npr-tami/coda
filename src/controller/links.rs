@@ -15,7 +15,7 @@ use super::listen::{Done, READ_TIMEOUT, SLOW_TIMEOUT, in_time, now_ms};
 use super::{Controller, lock, persist};
 use crate::listen::links::{MAX_LINKS, clean_name, is_stop};
 use crate::listen::{self, HostState};
-use crate::model::{Event, LinkState, LinkView};
+use crate::model::{Event, LinkPlaylist, LinkState, LinkView};
 
 /// A link being made.
 pub(super) struct Making {
@@ -80,6 +80,44 @@ impl Controller {
 
     pub(super) fn send_links(&self) {
         self.ui.send(Event::ListenLinks(Arc::new(self.links_view())));
+        self.send_link_playlists();
+    }
+
+    /// The account's own link playlists: every link of this account here, then any other playlist
+    /// of theirs the lists leave out as a link's (made on another PC, or by an older Coda).
+    pub(super) fn link_playlists(&self) -> Vec<LinkPlaylist> {
+        let me = self.me();
+        if me.is_empty() {
+            return Vec::new();
+        }
+        let mut list: Vec<LinkPlaylist> = self
+            .links
+            .mine(&me)
+            .filter(|l| !l.uri.is_empty())
+            .map(|l| LinkPlaylist { uri: l.uri.clone(), link: Some((l.id, l.name.clone())) })
+            .collect();
+        let shown = self.playlists_for_ui();
+        for p in self.playlists.iter().filter(|p| p.owned && !shown.iter().any(|s| s.uri == p.uri)) {
+            if !list.iter().any(|l| l.uri == p.uri) {
+                list.push(LinkPlaylist { uri: p.uri.clone(), link: None });
+            }
+        }
+        list
+    }
+
+    pub(super) fn send_link_playlists(&self) {
+        self.ui.send(Event::LinkPlaylists(Arc::new(self.link_playlists())));
+    }
+
+    /// Deletes one of the account's link playlists from its page: a link's goes with its link (it
+    /// stops working and leaves the Friends tab), another one just goes.
+    pub(super) fn cmd_delete_link_playlist(&mut self, uri: String) {
+        let me = self.me();
+        if let Some(id) = self.links.by_uri(&uri).filter(|l| l.is_mine(&me)).map(|l| l.id) {
+            self.cmd_listen_remove_link(id);
+        } else if self.link_playlists().iter().any(|l| l.uri == uri) {
+            self.delete_unused_link_playlist(uri);
+        }
     }
 
     pub(super) fn save_links(&self) {

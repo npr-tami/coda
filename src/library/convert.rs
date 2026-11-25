@@ -4,7 +4,7 @@
 //! the generated accessors return defaults for absent optional fields, and every lookup that
 //! can fail falls back to an empty / "unknown" value.
 
-use librespot_core::{SpotifyId, date::Date};
+use librespot_core::SpotifyId;
 use librespot_protocol::metadata::{self as pb, image::Size as ImageSize};
 use librespot_protocol::playlist4_external::ListAttributes;
 
@@ -56,68 +56,6 @@ pub fn fingerprint<'a>(uris: impl IntoIterator<Item = &'a str>) -> String {
     format!("{hash:016x}")
 }
 
-/// What decides whether the current account can play an item (mirrors librespot's player).
-#[derive(Debug, Clone)]
-pub struct Market {
-    /// Two-letter country code of the account, empty if not known yet.
-    pub country: String,
-    /// Account catalogue ("premium" for every account that can use Coda).
-    pub catalogue: String,
-    pub filter_explicit: bool,
-    pub now: Date,
-}
-
-impl Market {
-    pub fn from_session(session: &librespot_core::Session) -> Self {
-        Self {
-            country: session.country(),
-            catalogue: session
-                .get_user_attribute("catalogue")
-                .filter(|c| !c.is_empty())
-                .unwrap_or_else(|| "premium".to_owned()),
-            filter_explicit: session.filter_explicit_content(),
-            now: Date::now_utc(),
-        }
-    }
-}
-
-fn country_listed(list: &str, country: &str) -> bool {
-    list.as_bytes()
-        .chunks(2)
-        .any(|code| code.eq_ignore_ascii_case(country.as_bytes()))
-}
-
-/// Same rule as librespot's `allowed_for_user`: the first restriction that applies to the
-/// user's catalogue and carries a country list decides.
-pub fn allowed_in_market(restrictions: &[pb::Restriction], market: &Market) -> bool {
-    if market.country.is_empty() {
-        return true;
-    }
-    for r in restrictions
-        .iter()
-        .filter(|r| r.catalogue_str.iter().any(|c| c == &market.catalogue))
-    {
-        if r.has_countries_allowed() {
-            return country_listed(r.countries_allowed(), &market.country);
-        }
-        if r.has_countries_forbidden() {
-            return !country_listed(r.countries_forbidden(), &market.country);
-        }
-    }
-    true
-}
-
-/// Same rule as librespot's `available`: no availability windows means available.
-fn released(availability: &[pb::Availability], now: &Date) -> bool {
-    if availability.is_empty() {
-        return true;
-    }
-    availability.iter().any(|a| match a.start.as_ref() {
-        None => true,
-        Some(start) => Date::try_from(start).map(|s| *now >= s).unwrap_or(true),
-    })
-}
-
 fn effective_width(img: &pb::Image) -> i32 {
     if img.width() > 0 {
         return img.width();
@@ -158,10 +96,11 @@ fn album_images(album: &pb::Album) -> &[pb::Image] {
     if group.is_empty() { &album.cover } else { group }
 }
 
-/// Map a `TRACK_V4` metadata message. `respect_files`: treat a track without audio files and
-/// without alternatives as unplayable (disabled when a whole response carries no file lists,
-/// so a server-side format change can never mark an entire library unplayable).
-pub fn track_info(uri: &str, t: &pb::Track, market: &Market, respect_files: bool) -> TrackInfo {
+/// Map a `TRACK_V4` metadata message. Every track Spotify answers for is playable: an empty
+/// audio-file list, a region restriction or a release date are often temporary or wrong, and a
+/// song that really can't play is skipped when it is reached, never greyed out. Only a track
+/// Spotify says doesn't exist is greyed out (see [`unavailable_info`]).
+pub fn track_info(uri: &str, t: &pb::Track) -> TrackInfo {
     let album = t.album.get_or_default();
 
     let mut artists: Vec<ArtistRef> = t
@@ -192,18 +131,6 @@ pub fn track_info(uri: &str, t: &pb::Track, market: &Market, respect_files: bool
 
     let (cover_small, cover_large) = pick_covers(album_images(album));
 
-    let has_audio = !t.file.is_empty() || !t.alternative.is_empty();
-    let live = !t.has_earliest_live_timestamp()
-        || Date::from_timestamp_ms(t.earliest_live_timestamp())
-            .map(|d| market.now >= d)
-            .unwrap_or(true);
-    let playable = t.duration() > 0
-        && (has_audio || !respect_files)
-        && live
-        && released(&t.availability, &market.now)
-        && allowed_in_market(&t.restriction, market)
-        && !(t.explicit() && market.filter_explicit);
-
     TrackInfo {
         uri: uri.to_owned(),
         name: non_empty_or(t.name(), "Unknown track"),
@@ -213,14 +140,15 @@ pub fn track_info(uri: &str, t: &pb::Track, market: &Market, respect_files: bool
         cover_small,
         cover_large,
         duration_ms: t.duration().max(0) as u32,
-        playable,
+        playable: true,
         is_local: false,
         added_at: 0,
     }
 }
 
 /// Map an `EPISODE_V4` metadata message. The show stands in for artist and album.
-pub fn episode_info(uri: &str, e: &pb::Episode, market: &Market, respect_files: bool) -> TrackInfo {
+/// Map an `EPISODE_V4` metadata message; playable for the same reasons as [`track_info`].
+pub fn episode_info(uri: &str, e: &pb::Episode) -> TrackInfo {
     let show = e.show.get_or_default();
     let show_uri = gid_uri("show", show.gid());
     let own = &e.cover_image.get_or_default().image;
@@ -233,12 +161,6 @@ pub fn episode_info(uri: &str, e: &pb::Episode, market: &Market, respect_files: 
         vec![ArtistRef { name: show.name().to_owned(), uri: show_uri.clone() }]
     };
 
-    let playable = e.duration() > 0
-        && (!e.audio.is_empty() || !respect_files)
-        && released(&e.availability, &market.now)
-        && allowed_in_market(&e.restriction, market)
-        && !(e.explicit() && market.filter_explicit);
-
     TrackInfo {
         uri: uri.to_owned(),
         name: non_empty_or(e.name(), "Unknown episode"),
@@ -248,13 +170,14 @@ pub fn episode_info(uri: &str, e: &pb::Episode, market: &Market, respect_files: 
         cover_small,
         cover_large,
         duration_ms: e.duration().max(0) as u32,
-        playable,
+        playable: true,
         is_local: false,
         added_at: 0,
     }
 }
 
-/// Entry for something Spotify no longer has (or that Coda can't play).
+/// Entry for something Spotify says doesn't exist (or that isn't a Spotify track at all):
+/// the only kind greyed out.
 pub fn unavailable_info(uri: &str) -> TrackInfo {
     TrackInfo {
         uri: uri.to_owned(),
@@ -269,6 +192,12 @@ pub fn unavailable_info(uri: &str) -> TrackInfo {
         is_local: false,
         added_at: 0,
     }
+}
+
+/// Entry for a track whose details didn't come (Spotify busy, rate limits): playable, so it is
+/// tried when reached, and looked up again the next time its list is read (no length).
+pub fn unknown_info(uri: &str) -> TrackInfo {
+    TrackInfo { name: "Unknown track".to_owned(), playable: true, ..unavailable_info(uri) }
 }
 
 pub fn is_local_uri(uri: &str) -> bool {
@@ -493,28 +422,42 @@ mod tests {
         );
     }
 
+    fn track_with(files: bool) -> pb::Track {
+        let mut t = pb::Track::new();
+        t.set_name("Song".into());
+        t.set_duration(180_000);
+        if files {
+            let mut f = pb::AudioFile::new();
+            f.set_file_id(vec![1; 20]);
+            t.file.push(f);
+        }
+        t
+    }
+
     #[test]
-    fn restrictions_follow_librespot_rules() {
-        let market = Market {
-            country: "SE".into(),
-            catalogue: "premium".into(),
-            filter_explicit: false,
-            now: Date::now_utc(),
-        };
-        let mut allowed = pb::Restriction::new();
-        allowed.catalogue_str = vec!["premium".into()];
-        allowed.set_countries_allowed("USGBSE".into());
-        assert!(allowed_in_market(std::slice::from_ref(&allowed), &market));
-        allowed.set_countries_allowed("USGB".into());
-        assert!(!allowed_in_market(std::slice::from_ref(&allowed), &market));
-        let mut forbidden = pb::Restriction::new();
-        forbidden.catalogue_str = vec!["premium".into()];
-        forbidden.set_countries_forbidden("SEDK".into());
-        assert!(!allowed_in_market(std::slice::from_ref(&forbidden), &market));
-        let mut other = pb::Restriction::new();
-        other.catalogue_str = vec!["free".into()];
-        other.set_countries_allowed("US".into());
-        assert!(allowed_in_market(std::slice::from_ref(&other), &market));
+    fn an_empty_audio_file_list_does_not_grey_out() {
+        assert!(track_info("spotify:track:4uLU6hMCjMI75M1A2tKUQC", &track_with(true)).playable);
+        assert!(track_info("spotify:track:4uLU6hMCjMI75M1A2tKUQC", &track_with(false)).playable);
+    }
+
+    #[test]
+    fn restrictions_and_release_dates_do_not_grey_out() {
+        let mut t = track_with(false);
+        let mut r = pb::Restriction::new();
+        r.catalogue_str = vec!["premium".into()];
+        r.set_countries_allowed("US".into());
+        t.restriction.push(r);
+        t.set_explicit(true);
+        t.set_earliest_live_timestamp(i64::MAX / 4);
+        assert!(track_info("spotify:track:4uLU6hMCjMI75M1A2tKUQC", &t).playable);
+        assert!(episode_info("spotify:episode:512ojhOuo1ktJprKbVcKyQ", &pb::Episode::new()).playable);
+    }
+
+    #[test]
+    fn only_tracks_spotify_says_dont_exist_are_greyed_out() {
+        assert!(!unavailable_info("spotify:track:4uLU6hMCjMI75M1A2tKUQC").playable);
+        let unknown = unknown_info("spotify:track:4uLU6hMCjMI75M1A2tKUQC");
+        assert!(unknown.playable && unknown.duration_ms == 0);
     }
 
     #[test]

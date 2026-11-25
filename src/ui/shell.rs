@@ -178,6 +178,10 @@ impl CodaApp {
         self.handle_shell_jobs();
         self.follow_windows_mode(ctx);
         self.follow_icon_style(ctx);
+        if self.shell.platform.wants_playlist() {
+            let name = self.playback.source.as_ref().map(|s| self.source_title(s)).unwrap_or_default();
+            self.shell.platform.set_playlist(&name);
+        }
         self.shell.platform.update(&self.playback);
         for action in self.shell.platform.poll() {
             self.handle_platform_action(ctx, action);
@@ -215,6 +219,7 @@ impl CodaApp {
                     self.toggle_mini(ctx);
                 }
             }
+            PlatformAction::ToggleHideDiscord => self.toggle_discord_hidden(),
             PlatformAction::Quit => self.quit(ctx),
         }
     }
@@ -297,6 +302,13 @@ impl CodaApp {
         // (the hidden start).
         root_cmd(ctx, ViewportCommand::Minimized(false));
         root_cmd(ctx, ViewportCommand::Focus);
+        // The hidden start minimized the window behind winit's back, so the line above does
+        // nothing for it: restored here, or it shows as Windows' tiny minimized strip.
+        if let Some(hwnd) = self.main_hwnd()
+            && super::window::restore_if_minimized(hwnd)
+        {
+            log::info!("restored the window from minimized");
+        }
         self.shell.hidden = false;
         self.shell.focus_again = true;
         self.shell.settle = SETTLE_FRAMES;
@@ -610,8 +622,16 @@ impl CodaApp {
             }
             self.shell.maximize_when_shown = true;
         }
-        let Some((normal, maximized)) = self.main_hwnd().and_then(super::window::placement) else { return };
+        let Some(hwnd) = self.main_hwnd() else { return };
+        // Minimized behind winit's back (the hidden start): nothing worth keeping.
+        if super::window::is_minimized(hwnd) {
+            return;
+        }
+        let Some((normal, maximized)) = super::window::placement(hwnd) else { return };
         let rect = [normal.left, normal.top, normal.right, normal.bottom];
+        if !super::window::plausible_place(rect, [FULL_MIN_SIZE.x as i32, FULL_MIN_SIZE.y as i32]) {
+            return;
+        }
         if self.prefs.main_window_rect != Some(rect) || self.prefs.main_window_maximized != maximized {
             self.prefs.main_window_rect = Some(rect);
             self.prefs.main_window_maximized = maximized;
@@ -751,6 +771,14 @@ impl CodaApp {
             log::info!("Windows switched to {} mode", if theme::shows_dark(ThemeMode::System) { "dark" } else { "light" });
             self.restyle(ctx);
         }
+    }
+
+    /// "Hide from Discord" (player bar menu, tray): takes the status away for now, or brings it back.
+    pub(super) fn toggle_discord_hidden(&mut self) {
+        self.prefs.discord_hidden = !self.prefs.discord_hidden;
+        self.prefs_changed();
+        self.apply_platform_settings();
+        self.note(if self.prefs.discord_hidden { "Hidden from Discord" } else { "Showing on Discord again" }, None);
     }
 
     /// Re-applies the Windows-integration settings (media controls, tray, Discord).

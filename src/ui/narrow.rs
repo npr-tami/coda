@@ -5,7 +5,7 @@
 
 use std::time::Instant;
 
-use egui::{Align2, CornerRadius, CursorIcon, Id, Rect, ScrollArea, Sense, Stroke, Ui, pos2, vec2};
+use egui::{Align2, CornerRadius, CursorIcon, Id, Rect, ScrollArea, Sense, Ui, pos2, vec2};
 
 use super::fin::{self, Look};
 use super::frame::Layout;
@@ -26,32 +26,43 @@ const PAD_X: f32 = 16.0;
 impl CodaApp {
     /// Everything under the title bar at narrow widths, in `body` (down to the window's foot).
     pub(super) fn narrow_body(&mut self, ui: &mut Ui, body: Rect, l: &Layout) {
+        use super::frame::{CARD_GAP, CARD_R};
         let p = self.palette;
+        // Islands: the page and the mini player are cards on the window's base, the tabs on the base.
+        let base = p.base_bg();
+        super::frame::region(ui, body, "narrow-base", Some(base), |_| {});
         let tabs = Rect::from_min_max(egui::pos2(body.left(), body.bottom() - TABS_H), body.max);
         let playing_page = self.middle_tab == MiddleTab::Playing;
-        let mini = Rect::from_min_max(pos2(body.left(), tabs.top() - if playing_page { 0.0 } else { MINI_H }), pos2(body.right(), tabs.top()));
-        let page = Rect::from_min_max(body.min, pos2(body.right(), mini.top()));
-        super::frame::region(ui, page, "narrow-page", Some(p.main_bg), |ui| {
-            self.wallpaper_behind_songs(ui);
+        let (l_x, r_x) = (body.left() + CARD_GAP, body.right() - CARD_GAP);
+        let mini = Rect::from_min_max(pos2(l_x, tabs.top() - if playing_page { 0.0 } else { MINI_H }), pos2(r_x, tabs.top()));
+        let page = Rect::from_min_max(pos2(l_x, body.top()), pos2(r_x, mini.top() - if playing_page { 0.0 } else { CARD_GAP }));
+        let r = CornerRadius::same(CARD_R);
+        super::frame::region(ui, page, "narrow-page", None, |ui| {
+            ui.painter().rect_filled(page, r, p.main_bg);
+            self.wallpaper_in_card(ui, true, super::frame::CARD_WALL);
             self.page(ui, p.main_bg, |app, ui| match app.middle_tab {
                 MiddleTab::Playing => app.playing_page(ui),
                 MiddleTab::Library => app.library_page(ui),
                 _ => app.center_view(ui),
             });
         });
+        self.round_card_corners(ui.painter(), page, f32::from(CARD_R), base);
         if !playing_page {
-            super::frame::region(ui, mini, "narrow-mini", Some(p.raised_bg), |ui| self.mini_bar(ui));
+            super::frame::region(ui, mini, "narrow-mini", None, |ui| {
+                ui.painter().rect_filled(mini, r, p.sidebar_bg);
+                self.mini_bar(ui);
+            });
+            self.round_card_corners(ui.painter(), mini, f32::from(CARD_R), base);
         }
-        super::frame::region(ui, tabs, "narrow-tabs", Some(p.main_bg), |ui| self.bottom_tabs(ui));
+        super::frame::region(ui, tabs, "narrow-tabs", None, |ui| self.bottom_tabs(ui));
         let _ = l;
     }
 
-    /// Home, Search, Library and Playing (`.ntabs`): icon above name; the chosen one bright, with an
-    /// accent bar on top.
+    /// Home, Search, Library and Playing (`.ntabs`): icon above name, on the window's base; the chosen
+    /// one bright, its icon in the accent on a raised pill.
     fn bottom_tabs(&mut self, ui: &mut Ui) {
         let p = self.palette;
         let r = ui.max_rect();
-        ui.painter().hline(r.x_range(), r.top() + 0.5, Stroke::new(1.0, p.border));
         let library = matches!(self.middle_tab, MiddleTab::Library | MiddleTab::Albums | MiddleTab::Artists | MiddleTab::Songs | MiddleTab::Blocked)
             && !self.home_shown();
         let tabs = [
@@ -61,10 +72,10 @@ impl CodaApp {
             ("disc", "Playing", self.middle_tab == MiddleTab::Playing, MiddleTab::Playing),
         ];
         let w = r.width() / tabs.len() as f32;
-        // The bar slides to the tab picked.
-        let chosen = tabs.iter().position(|t| t.2).map(|k| (k, Rect::from_center_size(pos2(r.left() + (k as f32 + 0.5) * w, r.top() + 1.5), vec2(40.0, 3.0))));
-        motion::marker(ui.ctx(), Id::new("ntab-bar"), r.min, chosen, motion::TAB, |bar, a| {
-            ui.painter().rect_filled(bar, CornerRadius { nw: 0, ne: 0, sw: 2, se: 2 }, p.accent_ink.gamma_multiply(a));
+        // The pill slides to the tab picked.
+        let chosen = tabs.iter().position(|t| t.2).map(|k| (k, Rect::from_center_size(pos2(r.left() + (k as f32 + 0.5) * w, r.top() + 21.0), vec2(52.0, 26.0))));
+        motion::marker(ui.ctx(), Id::new("ntab-bar"), r.min, chosen, motion::TAB, |pill, a| {
+            ui.painter().rect_filled(pill, CornerRadius::same(13), p.widget_bg.gamma_multiply(a));
         });
         for (k, (icon, name, on, tab)) in tabs.into_iter().enumerate() {
             let cell = Rect::from_min_size(pos2(r.left() + k as f32 * w, r.top()), vec2(w, r.height()));
@@ -91,8 +102,10 @@ impl CodaApp {
         let r = ui.max_rect();
         let open = ui.interact(r, Id::new("mini-bar"), Sense::click());
         let done = self.song_done();
-        ui.painter().rect_filled(Rect::from_min_size(r.min, vec2(r.width(), 2.0)), CornerRadius::ZERO, p.border);
-        ui.painter().rect_filled(Rect::from_min_size(r.min, vec2(r.width() * done, 2.0)), CornerRadius::ZERO, p.accent_ink);
+        // How far the song is: a line along the card's foot, kept clear of its round corners.
+        let line = Rect::from_min_max(pos2(r.left() + 12.0, r.bottom() - 3.0), pos2(r.right() - 12.0, r.bottom() - 1.0));
+        ui.painter().rect_filled(line, CornerRadius::same(1), p.border);
+        ui.painter().rect_filled(Rect::from_min_size(line.min, vec2(line.width() * done, line.height())), CornerRadius::same(1), p.accent_ink);
         let Some(track) = self.playback.track.clone() else {
             ui.painter().text(pos2(r.left() + PAD_X, r.center().y), Align2::LEFT_CENTER, "Nothing playing", regular(12.0), p.text_weak);
             return;
@@ -147,7 +160,7 @@ impl CodaApp {
             // The sidebar's lists, as wide as the page (4 sleeves across at 480).
             let mut child = ui.new_child(egui::UiBuilder::new().max_rect(Rect::from_min_max(pos2(left - 10.0, y), pos2(left + w + 10.0, y + 100_000.0))));
             child.spacing_mut().item_spacing = vec2(0.0, 0.0);
-            self.sidebar_lists(&mut child);
+            self.sidebar_lists(&mut child, 112.0);
             let used = child.min_rect();
             ui.advance_cursor_after_rect(Rect::from_min_max(pos2(left, y), pos2(left + w, used.bottom() + 24.0)));
         });
@@ -195,7 +208,7 @@ impl CodaApp {
             self.go_back();
         }
         let from = self.playback.source.as_ref().map(|s| self.source_title(s)).unwrap_or_default();
-        let kicker = fin::spaced(ui, "PLAYING FROM", bold(10.0), p.text_weak, 1.0);
+        let kicker = fin::spaced(ui, "Playing from", medium(11.5), p.text_weak, 0.0);
         let kh = kicker.size().y;
         ui.painter().galley(pos2(down.right() + 8.0, head.center().y - kh - 1.0), kicker, p.text_weak);
         let place = self.deck.as_ref().filter(|d| !d.order.is_empty()).map(|d| format!("Song {} of {}", fmt_thousands((d.now + 1).min(d.order.len())), fmt_thousands(d.order.len())));
@@ -263,7 +276,7 @@ impl CodaApp {
     }
 
     /// A list's name, as far as it is known.
-    fn source_title(&self, s: &crate::model::Source) -> String {
+    pub(super) fn source_title(&self, s: &crate::model::Source) -> String {
         use crate::model::Source;
         match s {
             Source::LikedSongs => "Liked Songs".to_owned(),

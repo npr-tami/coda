@@ -215,6 +215,22 @@ fn user_row(ui: &mut Ui, p: &Palette, rect: Rect, u: &Card, q: &str, picture: &m
     act
 }
 
+/// A playlist's, album's or artist's card's right-click menu: Open and Copy link.
+fn card_menu(resp: &egui::Response, uri: &str, act: &mut Option<Act>) {
+    resp.context_menu(|ui| {
+        ui.set_width(200.0);
+        if fin::menu_item(ui, Some("chevr"), "Open", None, false, true).clicked() {
+            *act = Some(Act::Open(source_of(uri)));
+            ui.close();
+        }
+        let link = spotify_web_link(uri);
+        if fin::menu_item(ui, Some("link"), "Copy link", None, false, link.is_some()).clicked() {
+            *act = Some(Act::CopyPage(uri.to_owned()));
+            ui.close();
+        }
+    });
+}
+
 /// What a click on the page asked for.
 enum Act {
     Play(TrackInfo),
@@ -227,6 +243,8 @@ enum Act {
     User(String),
     /// A link to a person's profile, to copy.
     CopyLink(String),
+    /// A playlist's, album's or artist's link to copy (by its uri).
+    CopyPage(String),
     MoreUsers,
 }
 
@@ -236,6 +254,17 @@ impl CodaApp {
         if focused_now && self.middle_tab != MiddleTab::Search {
             self.search.back = Some(self.middle_tab);
             self.middle_tab = MiddleTab::Search;
+        }
+        // A pasted Spotify link opens its page instead of being searched for.
+        if (changed || enter) && super::search::pasted_link(&self.search.input).is_some() {
+            let text = std::mem::take(&mut self.search.input);
+            self.search.typed_at = None;
+            if self.middle_tab == MiddleTab::Search {
+                self.middle_tab = self.search.back.take().unwrap_or(MiddleTab::Home);
+            }
+            self.open_pasted_link(&text);
+            self.ctx.memory_mut(|m| m.surrender_focus(egui::Id::new(super::search::SEARCH_BOX_ID)));
+            return;
         }
         if changed {
             self.search.typed_at = Some(Instant::now());
@@ -373,6 +402,7 @@ impl CodaApp {
                 ui.ctx().copy_text(link);
                 self.note("Profile link copied", None);
             }
+            Some(Act::CopyPage(uri)) => self.copy_link(&uri),
             Some(Act::MoreUsers) => {
                 if let Some(offset) = self.search.users.next {
                     self.ask_users(offset);
@@ -631,6 +661,9 @@ impl CodaApp {
         let pr = ui.interact(play, Id::new("search-top-play"), Sense::click()).on_hover_cursor(CursorIcon::PointingHand).on_hover_text("Play (Enter)");
         painter.circle_filled(play.center(), 17.0, if pr.hovered() { p.accent } else { p.widget_bg });
         svgicon::paint(&painter, Rect::from_center_size(play.center() + vec2(1.0, 0.0), vec2(14.0, 14.0)), "play", if pr.hovered() { p.on_accent } else { p.text }, svgicon::STROKE);
+        if let Top::Card(c, _) = top {
+            card_menu(&resp, &c.uri, act);
+        }
         if pr.clicked() {
             *act = Some(Act::PlayTop);
         } else if resp.clicked() {
@@ -649,7 +682,7 @@ impl CodaApp {
         let resp = ui.interact(rect, Id::new(("search-song", &t.uri)), Sense::click_and_drag());
         // Only the left button drags songs; local files can't go into Spotify playlists.
         if resp.drag_started_by(egui::PointerButton::Primary) && !t.is_local {
-            resp.dnd_set_drag_payload(super::dnd::SongsDrag { uris: vec![t.uri.clone()] });
+            resp.dnd_set_drag_payload(super::dnd::SongsDrag::one(t));
         }
         let current = self.playback.track.as_ref().is_some_and(|c| c.uri == t.uri);
         if current || resp.hovered() {
@@ -721,6 +754,7 @@ impl CodaApp {
         if resp.clicked() {
             *act = Some(Act::Open(source_of(&card.uri)));
         }
+        card_menu(&resp, &card.uri, act);
         h
     }
 
@@ -794,23 +828,23 @@ mod tests {
     fn a_cards_name_wraps_to_two_lines_before_it_is_cut() {
         let ctx = ctx();
         let lay = |text: &str, rows: usize| {
-            let job = highlight_job(text, find_folded(text, "radio"), crate::ui::theme::medium(11.5), Color32::WHITE, Color32::RED, 100.0, rows);
+            let job = highlight_job(text, find_folded(text, "jazz"), crate::ui::theme::medium(11.5), Color32::WHITE, Color32::RED, 100.0, rows);
             ctx.fonts_mut(|f| f.layout_job(job))
         };
         // Short: one line, whole.
-        let g = lay("Radio", CARD_NAME_ROWS);
-        assert_eq!((g.rows.len(), g.text()), (1, "Radio"));
+        let g = lay("Jazz 6", CARD_NAME_ROWS);
+        assert_eq!((g.rows.len(), g.text()), (1, "Jazz 6"));
         // Longer than a line: the second line shows the rest, no "…".
-        let g = lay("Late night city radio", CARD_NAME_ROWS);
+        let g = lay("Radio Late Nights Jazz 6", CARD_NAME_ROWS);
         assert_eq!(g.rows.len(), 2);
         assert!(!g.elided && !g.text().contains('…'), "{:?}", g.text());
         // Far too long: two lines, then "…".
-        let g = lay("Every radio station in the city, every song, every DJ and every ad, all of it", CARD_NAME_ROWS);
+        let g = lay("Jazz 6 Soundtrack every radio station every song every DJ every ad all of it", CARD_NAME_ROWS);
         assert_eq!(g.rows.len(), 2);
         assert!(g.elided);
         assert!(g.rows.iter().all(|r| r.rect().width() <= 100.5));
         // One line (the top result, song rows): cut as before.
-        assert_eq!(lay("Late night city radio", 1).rows.len(), 1);
+        assert_eq!(lay("Radio Late Nights Jazz 6", 1).rows.len(), 1);
     }
 
     fn person(id: &str, name: &str) -> Card {

@@ -8,7 +8,7 @@ use std::sync::Arc;
 use egui::{Align2, Color32, CornerRadius, CursorIcon, Id, Rect, Sense, Stroke, Ui, pos2, vec2};
 
 use super::fin::{self, Look};
-use super::frame::{Layout, Mode};
+use super::frame::Layout;
 use super::motion;
 use super::svgicon;
 use super::theme::{bold, heavy, medium, regular};
@@ -16,6 +16,34 @@ use super::tracks::one_line;
 use super::util::{fmt_ms, fmt_thousands, fmt_total};
 use super::{CodaApp, Undo};
 use crate::model::{Command, LyricLine, PlayStatus, TrackInfo};
+
+/// Up next's rows.
+const ROW: f32 = 40.0;
+/// The head ("Song 706 of 890"): its first line's words start as far down the card as the page's
+/// hero words and the sidebar's first row (`HEAD_TOP`), and 12 below the second.
+const HEAD_TOP: f32 = 18.0;
+const HEAD_H: f32 = 72.0;
+/// Where a row of Up next being dragged is kept (egui's temp data).
+const QUEUE_DRAG: &str = "queue-drag";
+
+/// A row of Up next being dragged: its place.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct QueueDrag {
+    from: usize,
+}
+
+/// Of `n` rows `ROW` tall from `top`, the ones in `view` (a few more at the ends).
+fn visible_rows(top: f32, n: usize, view: egui::Rangef) -> std::ops::Range<usize> {
+    let first = ((view.min - top) / ROW).floor().max(0.0) as usize;
+    let below = ((view.max - top) / ROW).ceil();
+    let last = if below > 0.0 { (below as usize + 1).min(n) } else { 0 };
+    first.min(last)..last
+}
+
+/// Of `n` rows `ROW` tall from `top`, the one at height `y` (the first or last beyond them).
+fn drop_row(top: f32, n: usize, y: f32) -> usize {
+    (((y - top) / ROW).floor().max(0.0) as usize).min(n.saturating_sub(1))
+}
 
 /// How long (base seconds, see [`motion::secs`]) the side panel's lyrics take to glide when the sung
 /// line changes: the list sliding to keep it in place, the line growing into its size and colour.
@@ -101,6 +129,15 @@ pub fn line_at(lines: &[LyricLine], pos_ms: u32) -> Option<usize> {
     lines.iter().rposition(|l| l.start_ms <= pos_ms)
 }
 
+/// The record's size on the side panel's turntable in a panel `w` wide and `h` tall: 176 at most, the
+/// plinth (1.2 times it) within the panel's width less 32, and small enough to leave the tabs about 330
+/// under it in a short panel; never under 110.
+pub fn record_size(w: f32, h: f32) -> f32 {
+    let by_width = (w - 32.0) / 1.3;
+    let by_height = (h - HEAD_H - 14.0 - 38.0 - 330.0) / 1.2;
+    by_width.min(by_height).clamp(110.0, 176.0).round()
+}
+
 impl CodaApp {
     /// The playing song's lyrics: asked for once, the first time they are needed.
     pub(super) fn current_lyrics(&mut self) -> Option<Lyrics> {
@@ -115,27 +152,22 @@ impl CodaApp {
 
     pub(super) fn side_panel(&mut self, ui: &mut Ui, l: &Layout) {
         let r = ui.max_rect();
-        let full = l.panel_w >= 340.0;
-        let head = Rect::from_min_size(r.min, vec2(r.width(), 58.0));
+        let full = l.panel_w >= 320.0;
+        let head = Rect::from_min_size(r.min, vec2(r.width(), HEAD_H));
         self.panel_head(ui, head, full);
         let mut y = head.bottom();
 
         if self.prefs.panel_record {
-            // The plinth: 32 narrower than the panel, 1.2 times the record; the record 176 / 150 wide,
-            // or 150 / 132 at medium widths, by the window's height.
-            let tall = ui.ctx().content_rect().height() >= 820.0;
-            let d = match (l.mode == Mode::Wide, tall) {
-                (true, true) => 176.0,
-                (true, false) => 150.0,
-                (false, true) => 150.0,
-                (false, false) => 132.0,
-            };
+            // The plinth: 32 narrower than the panel, 1.2 times the record. The record is 176 at most,
+            // narrower in a narrow panel, and smaller in a short one, so the tabs keep about 330 under it
+            // (at least 110).
+            let d = record_size(r.width(), r.height());
             let plinth = Rect::from_min_size(pos2(r.left() + 16.0, y), vec2(r.width() - 32.0, (d * 1.2f32).round()));
             self.panel_plinth(ui, plinth, d);
             y = plinth.bottom() + 14.0;
         }
 
-        // The tabs: 38 tall, a line above and below, 18 apart.
+        // The tabs: chips on a 38 tall strip.
         let tabs = Rect::from_min_size(pos2(r.left(), y), vec2(r.width(), 38.0));
         self.panel_tabs(ui, tabs);
         let body = Rect::from_min_max(pos2(r.left(), tabs.bottom()), r.max);
@@ -153,7 +185,8 @@ impl CodaApp {
     /// under it, and the record and close buttons on the right.
     fn panel_head(&mut self, ui: &mut Ui, head: Rect, full: bool) {
         let p = self.palette;
-        let x_btn = Rect::from_min_size(pos2(head.right() - 8.0 - 30.0, head.center().y - 15.0), vec2(30.0, 30.0));
+        // The buttons sit on the first line ("Song 706"), 23 tall.
+        let x_btn = Rect::from_min_size(pos2(head.right() - 8.0 - 30.0, head.top() + HEAD_TOP + 11.5 - 15.0), vec2(30.0, 30.0));
         let tt_btn = x_btn.translate(vec2(-32.0, 0.0));
         let w = ui.ctx().content_rect().width();
         if fin::ib(ui, &p, x_btn, Id::new("panel-close"), "x", Look::Plain, "Close (Ctrl+P)").clicked() {
@@ -166,7 +199,7 @@ impl CodaApp {
         let left = head.left() + 16.0;
         let max_w = tt_btn.left() - 8.0 - left;
         let Some(d) = self.deck.clone().filter(|d| !d.order.is_empty()) else {
-            ui.painter().text(pos2(left, head.center().y), Align2::LEFT_CENTER, "Nothing playing", regular(12.0), p.text_weak);
+            ui.painter().text(pos2(left, x_btn.center().y), Align2::LEFT_CENTER, "Nothing playing", regular(12.0), p.text_weak);
             return;
         };
         let n = d.order.len();
@@ -179,8 +212,7 @@ impl CodaApp {
         let big = ui.fonts_mut(|f| f.layout_no_wrap(format!("Song {}", fmt_thousands(at)), heavy(19.0), p.text_strong));
         let small = one_line(ui, &tail, regular(11.5), p.text_weak, (max_w - big.size().x - 4.0).max(20.0), false);
         let sub = one_line(ui, &format!("{} to go · about {}", fmt_thousands(to_go), fmt_total(ms)), regular(11.0), p.text_weak, max_w, false);
-        let h = big.size().y + 2.0 + sub.size().y;
-        let top = head.center().y - h / 2.0;
+        let top = head.top() + HEAD_TOP;
         let bw = big.size().x;
         let base = top + big.size().y;
         ui.painter().galley(pos2(left, top), big, p.text_strong);
@@ -249,42 +281,42 @@ impl CodaApp {
     pub(super) fn panel_tabs(&mut self, ui: &mut Ui, tabs: Rect) {
         let p = self.palette;
         let painter = ui.painter().clone();
-        painter.hline(tabs.x_range(), tabs.top() + 0.5, Stroke::new(1.0, p.border));
-        painter.hline(tabs.x_range(), tabs.bottom() - 0.5, Stroke::new(1.0, p.border));
-        let count = self.up_next.as_ref().map_or(0, |l| l.len().min(50));
-        let mut x = tabs.left() + 16.0;
-        let mut line = None;
-        for (k, (tab, name)) in [(Tab::Lyrics, "Lyrics"), (Tab::UpNext, "Up next"), (Tab::Rules, "Rules"), (Tab::Friends, "Friends")].into_iter().enumerate() {
-            let on = self.frame.panel_tab == tab;
-            let font = if on { bold(12.0) } else { medium(12.0) };
-            let g = ui.fonts_mut(|f| f.layout_no_wrap(name.to_owned(), font, Color32::WHITE));
-            let mut w = g.size().x;
-            let small = (tab == Tab::UpNext && count > 0).then(|| ui.fonts_mut(|f| f.layout_no_wrap(count.to_string(), medium(10.5), p.text_weak)));
+        let count = self.up_next.as_ref().map_or(0, |l| l.len());
+        let all = [(Tab::Lyrics, "Lyrics"), (Tab::UpNext, "Up next"), (Tab::Rules, "Rules"), (Tab::Friends, "Friends")];
+        // The words, and Up next's count (dropped when the four don't fit the panel).
+        let names = all.map(|(_, name)| ui.fonts_mut(|f| f.layout_no_wrap(name.to_owned(), fin::tab_chip_font(), Color32::PLACEHOLDER)));
+        let small = (count > 0).then(|| ui.fonts_mut(|f| f.layout_no_wrap(fmt_thousands(count), medium(10.5), Color32::PLACEHOLDER)));
+        // Friends' layout button sits at the strip's right end (30 in from it).
+        let room = tabs.width() - 16.0 - if self.frame.panel_tab == Tab::Friends { 36.0 } else { 14.0 };
+        let mut widths = names.each_ref().map(|g| g.size().x);
+        let with_count = |w: &mut [f32; 4]| {
             if let Some(s) = &small {
-                w += 5.0 + s.size().x;
+                w[1] += 5.0 + s.size().x;
             }
-            let rect = Rect::from_min_size(pos2(x, tabs.top()), vec2(w, tabs.height()));
-            let resp = ui.interact(rect, Id::new(("panel-tab", name)), Sense::click()).on_hover_cursor(CursorIcon::PointingHand);
-            let color = fin::tab_ink(&p, on, resp.hovered());
-            let color = motion::color(ui.ctx(), resp.id, color, motion::HOVER);
-            let gh = g.size().y;
-            painter.galley_with_override_text_color(pos2(x, rect.center().y - gh / 2.0), g, color);
-            if let Some(s) = small {
-                let sh = s.size().y;
-                painter.galley(pos2(x + w - s.size().x, rect.center().y - sh / 2.0 + 0.5), s, p.text_weak);
+        };
+        let mut shown_count = small.is_some();
+        with_count(&mut widths);
+        if fin::tab_chips_least_w(&widths) > room || fin::tab_chips_w(&widths) > room + 20.0 {
+            widths = names.each_ref().map(|g| g.size().x);
+            shown_count = false;
+        }
+        let chosen = all.iter().position(|&(tab, _)| tab == self.frame.panel_tab);
+        let chips = fin::tab_chips(ui, &p, Id::new("panel-tabs"), tabs.left() + 16.0, tabs.center().y, room, &widths, chosen);
+        for (k, ((tab, _), chip)) in all.into_iter().zip(chips).enumerate() {
+            let g = names[k].clone();
+            let x = chip.rect.left() + chip.pad;
+            painter.galley_with_override_text_color(pos2(x, chip.rect.center().y - g.size().y / 2.0), g.clone(), chip.ink);
+            if k == 1
+                && shown_count
+                && let Some(s) = &small
+            {
+                let at = pos2(x + g.size().x + 5.0, chip.rect.center().y - s.size().y / 2.0 + 0.5);
+                painter.galley_with_override_text_color(at, s.clone(), chip.count_ink);
             }
-            if on {
-                line = Some((k, Rect::from_min_max(pos2(rect.left(), rect.bottom() - 2.0), pos2(rect.right(), rect.bottom() + 1.0))));
-            }
-            if resp.clicked() {
+            if chip.resp.clicked() {
                 self.frame.panel_tab = tab;
             }
-            x += w + 18.0;
         }
-        // The line slides to the tab picked.
-        motion::marker(ui.ctx(), Id::new("panel-tab-line"), tabs.min, line, motion::TAB, |bar, a| {
-            painter.rect_filled(bar, CornerRadius { nw: 2, ne: 2, sw: 0, se: 0 }, p.accent_ink.gamma_multiply(a));
-        });
         // The Friends tab's layout, at the strip's right end while it shows.
         if self.frame.panel_tab == Tab::Friends {
             let b = Rect::from_min_size(pos2(tabs.right() - 6.0 - 24.0, tabs.center().y - 12.0), vec2(24.0, 24.0));
@@ -315,10 +347,15 @@ impl CodaApp {
                 return;
             }
             Some(Lyrics::None) | None => {
+                // One line saying so, and what plays next under it rather than an empty panel.
                 let text = if self.playback.track.is_some() { "No lyrics for this song" } else { "Nothing playing" };
                 let was = motion::content_in(ui, fade_id);
-                ui.painter().text(pos2(left, body.top() + pad_top + 8.0), Align2::LEFT_CENTER, text, medium(size), p.text_weak);
+                ui.painter().text(pos2(left, body.top() + 18.0), Align2::LEFT_CENTER, text, medium(12.5), p.text_weak);
                 ui.set_opacity(was);
+                let rest = Rect::from_min_max(pos2(body.left(), body.top() + 30.0), body.max);
+                let mut child = ui.new_child(egui::UiBuilder::new().id_salt("lyrics-none-next").max_rect(rest));
+                child.set_clip_rect(rest.intersect(ui.clip_rect()));
+                self.panel_up_next(&mut child, rest);
                 return;
             }
         };
@@ -418,14 +455,17 @@ impl CodaApp {
             }
         }
         ui.set_opacity(was);
-        // The fade at the bottom (60 px to the panel's grey).
+        // The fade at the bottom (60 px to the panel's grey), and a short one under the tabs, so a line
+        // scrolled up goes soft instead of being cut.
         let fade = Rect::from_min_max(pos2(body.left(), body.bottom() - 60.0), body.max);
         fin::vgradient(ui.painter(), fade, Color32::TRANSPARENT, p.sidebar_bg);
+        let top_fade = Rect::from_min_size(body.min, vec2(body.width(), pad_top.min(18.0)));
+        fin::vgradient(ui.painter(), top_fade, p.sidebar_bg, Color32::TRANSPARENT);
         ui.ctx().request_repaint_after(std::time::Duration::from_millis(250));
     }
 
-    /// Up next (`.rpb`): Now, Queued, and From shuffle (the next 50 of the play order), each a small
-    /// spaced capital heading over 40-tall rows.
+    /// Up next (`.rpb`): Now, Queued, and From shuffle (the rest of the play order), each a heading
+    /// over 40-tall rows.
     pub(super) fn panel_up_next(&mut self, ui: &mut Ui, body: Rect) {
         let p = self.palette;
         let id = Id::new("upnext-scroll");
@@ -435,10 +475,10 @@ impl CodaApp {
             let mut y = ui.cursor().top() + 4.0;
             let heading = |ui: &mut Ui, y: &mut f32, text: &str, count: Option<usize>, action: Option<&str>| -> bool {
                 *y += 12.0;
-                let g = fin::spaced(ui, &text.to_uppercase(), bold(10.5), p.text_weak, 0.95);
+                let g = fin::spaced(ui, text, bold(12.0), p.text, 0.0);
                 let gh = g.size().y;
                 let gw = g.size().x;
-                ui.painter().galley(pos2(left + 4.0, *y), g, p.text_weak);
+                ui.painter().galley(pos2(left + 4.0, *y), g, p.text);
                 if let Some(c) = count {
                     ui.painter().text(pos2(left + 4.0 + gw + 8.0, *y + gh / 2.0), Align2::LEFT_CENTER, c.to_string(), medium(10.5), p.text_weak);
                 }
@@ -455,8 +495,8 @@ impl CodaApp {
             };
             if let Some(t) = self.playback.track.clone() {
                 heading(ui, &mut y, "Now", None, None);
-                self.queue_row_fin(ui, Rect::from_min_size(pos2(left, y), vec2(width, 40.0)), &t, true, false);
-                y += 40.0;
+                self.queue_row_fin(ui, Rect::from_min_size(pos2(left, y), vec2(width, ROW)), &t, None);
+                y += ROW;
             }
             // Up next starts with the songs the user queued.
             let list = self.up_next.clone().unwrap_or_default();
@@ -468,41 +508,120 @@ impl CodaApp {
                 ui.painter().text(pos2(left + 6.0, y + 2.0), Align2::LEFT_TOP, "Right-click a song and choose Add to queue", regular(11.0), p.text_weak);
                 y += 20.0;
             }
-            for (k, t) in list.iter().take(queued).enumerate() {
-                let row = Rect::from_min_size(pos2(left, y), vec2(width, 40.0));
-                self.queue_row_fin(ui, row, t, false, true);
-                let menu = ui.interact(row, Id::new(("queued-row", k)), Sense::click());
-                let mut remove = false;
-                menu.context_menu(|ui| {
-                    ui.set_width(200.0);
-                    if fin::menu_item(ui, Some("x"), "Remove from queue", None, false, true).clicked() {
-                        remove = true;
-                        ui.close();
-                    }
-                });
-                if remove {
-                    self.send(Command::Unqueue(Some(k)));
-                }
-                y += 40.0;
-            }
+            let queued_top = y;
+            y += queued as f32 * ROW;
             let shuffle = self.current_shuffle();
-            let rest = &list[queued..];
-            if heading(ui, &mut y, if shuffle { "From shuffle" } else { "Next in the list" }, Some(rest.len().min(50)), shuffle.then_some("Reshuffle")) {
+            let rest_n = list.len() - queued;
+            if heading(ui, &mut y, if shuffle { "From shuffle" } else { "Next in the list" }, Some(rest_n), shuffle.then_some("Reshuffle")) {
                 self.reshuffle();
             }
-            for t in rest.iter().take(50) {
-                self.queue_row_fin(ui, Rect::from_min_size(pos2(left, y), vec2(width, 40.0)), t, false, true);
-                y += 40.0;
+            let rest_top = y;
+            y += rest_n as f32 * ROW;
+            // Each part's rows: only the ones in view are drawn (and the one being dragged).
+            let clip = ui.clip_rect();
+            let drag = ui.ctx().data(|d| d.get_temp::<QueueDrag>(Id::new(QUEUE_DRAG)));
+            let mut menu: Option<(usize, egui::Pos2)> = None;
+            let mut started: Option<usize> = None;
+            for (part, top, range) in [(0, queued_top, 0..queued), (1, rest_top, queued..list.len())] {
+                let shown = visible_rows(top, range.len(), clip.y_range());
+                let dragged = drag.filter(|d| range.contains(&d.from)).map(|d| d.from - range.start);
+                for r in shown.chain(dragged) {
+                    let k = range.start + r;
+                    let row = Rect::from_min_size(pos2(left, top + r as f32 * ROW), vec2(width, ROW));
+                    let resp = self.queue_row_fin(ui, row, &list[k], Some(k));
+                    if resp.drag_started_by(egui::PointerButton::Primary) {
+                        started = Some(k);
+                        if !list[k].is_local {
+                            resp.dnd_set_drag_payload(super::dnd::SongsDrag::one(&list[k]));
+                        }
+                    }
+                    if resp.secondary_clicked() {
+                        menu = Some((k, resp.interact_pointer_pos().unwrap_or(row.center())));
+                    }
+                    if part == 0 {
+                        let mut remove = false;
+                        resp.context_menu(|ui| {
+                            ui.set_width(200.0);
+                            if fin::menu_item(ui, Some("x"), "Remove from queue", None, false, true).clicked() {
+                                remove = true;
+                                ui.close();
+                            }
+                        });
+                        if remove {
+                            self.send(Command::Unqueue(Some(k)));
+                        }
+                    }
+                }
             }
+            if let Some((k, at)) = menu.filter(|&(k, _)| k >= queued) {
+                self.open_song_menu(&list[k], at, None);
+            }
+            self.queue_drag(ui, started, &list, queued, (queued_top, rest_top), left..=(left + width), body);
             ui.allocate_space(vec2(width, (y - ui.cursor().top() + 16.0).max(0.0)));
             let _ = p;
         });
     }
 
-    /// A 40-tall song row (`.qr`): the drag grip, a 28 cover, the title and artists, and the time.
-    fn queue_row_fin(&mut self, ui: &mut Ui, rect: Rect, t: &TrackInfo, now: bool, grip: bool) {
+    /// A row of Up next being dragged (`started` this pass): where it would go shows as a line, and
+    /// let go over the list it moves there (MoveQueued); let go elsewhere (on a playlist) it was only
+    /// dragged there as a song. Near the list's top or bottom edge, the list scrolls.
+    #[allow(clippy::too_many_arguments)]
+    fn queue_drag(&mut self, ui: &mut Ui, started: Option<usize>, list: &[TrackInfo], queued: usize, tops: (f32, f32), xs: std::ops::RangeInclusive<f32>, body: Rect) {
+        let id = Id::new(QUEUE_DRAG);
+        if let Some(from) = started {
+            ui.ctx().data_mut(|d| d.insert_temp(id, QueueDrag { from }));
+        }
+        let Some(drag) = ui.ctx().data(|d| d.get_temp::<QueueDrag>(id)) else { return };
+        let (down, released, pointer) = ui.input(|i| (i.pointer.primary_down(), i.pointer.any_released(), i.pointer.latest_pos()));
+        let gone = drag.from >= list.len() || ui.input(|i| i.key_pressed(egui::Key::Escape));
+        if gone || (!down && !released) {
+            ui.ctx().data_mut(|d| d.remove::<QueueDrag>(id));
+            return;
+        }
+        let Some(at) = pointer else { return };
+        let (top, range) = if drag.from < queued { (tops.0, 0..queued) } else { (tops.1, queued..list.len()) };
+        let over = body.contains(at);
+        let to = range.start + drop_row(top, range.len(), at.y);
+        if released {
+            ui.ctx().data_mut(|d| d.remove::<QueueDrag>(id));
+            if over && to != drag.from {
+                self.send(Command::MoveQueued { from: drag.from, to });
+                // Shown at once; the controller's new Up next follows.
+                if let Some(next) = self.up_next.as_mut() {
+                    let l = Arc::make_mut(next);
+                    let t = l.remove(drag.from);
+                    l.insert(to, t);
+                }
+            }
+            return;
+        }
+        if !over {
+            return;
+        }
+        // The line where it goes: under the row it takes the place of when moving down, else over it.
+        let r = (to - range.start) as f32;
+        let ly = if to > drag.from { top + (r + 1.0) * ROW } else { top + r * ROW };
+        ui.painter().hline(xs, ly, Stroke::new(2.0, self.palette.accent_ink));
+        // Near an edge, the list scrolls toward it.
+        let clip = ui.clip_rect();
+        let edge = 36.0;
+        let dy = if at.y < clip.top() + edge { (clip.top() + edge - at.y) * 0.4 } else if at.y > clip.bottom() - edge { -(at.y - clip.bottom() + edge) * 0.4 } else { 0.0 };
+        if dy != 0.0 {
+            ui.scroll_with_delta(vec2(0.0, dy));
+            ui.ctx().request_repaint();
+        }
+    }
+
+    /// A 40-tall song row (`.qr`): the drag grip (Up next's place `k`; none for the playing song),
+    /// a 28 cover, the title and artists, and the time. Dragged by its grip or anywhere on it.
+    fn queue_row_fin(&mut self, ui: &mut Ui, rect: Rect, t: &TrackInfo, k: Option<usize>) -> egui::Response {
         let p = self.palette;
-        let resp = ui.interact(rect, Id::new(("qrow", &t.uri, now)), Sense::click());
+        let (now, grip) = (k.is_none(), k.is_some());
+        let sense = if now { Sense::click() } else { Sense::click_and_drag() };
+        let resp = ui.interact(rect, Id::new(("qrow", &t.uri, k)), sense);
+        if resp.dragged() {
+            ui.painter().rect_filled(rect, CornerRadius::same(6), p.hover_bg.gamma_multiply(0.6));
+        }
         if now || resp.hovered() {
             ui.painter().rect_filled(rect, CornerRadius::same(6), p.hover_bg);
         }
@@ -531,9 +650,11 @@ impl CodaApp {
             svgicon::paint(ui.painter(), Rect::from_min_size(pos2(right - time_w - 10.0 - 13.0, rect.center().y - 6.5), vec2(13.0, 13.0)), "eq", p.accent_ink, svgicon::STROKE);
         }
         ui.painter().text(pos2(right, rect.center().y), Align2::RIGHT_CENTER, fmt_ms(t.duration_ms), regular(11.0), p.text_weak);
-        if resp.on_hover_cursor(CursorIcon::PointingHand).double_clicked() && !now {
+        let resp = if resp.dragged() { resp } else { resp.on_hover_cursor(if grip { CursorIcon::Grab } else { CursorIcon::PointingHand }) };
+        if resp.double_clicked() && !now {
             self.play_track_from_up_next(&t.uri);
         }
+        resp
     }
 
     fn play_track_from_up_next(&mut self, uri: &str) {
@@ -569,14 +690,13 @@ impl CodaApp {
         }
         let card_h: f32 = heights.iter().sum::<f32>() + 2.0;
         let card = Rect::from_min_size(pos2(left, card_top), vec2(width, card_h));
-        ui.painter().rect_filled(card, CornerRadius::same(8), p.raised_bg);
-        ui.painter().rect_stroke(card, CornerRadius::same(8), Stroke::new(1.0, p.border), egui::StrokeKind::Inside);
+        ui.painter().rect_filled(card, CornerRadius::same(super::kit::CARD_RADIUS), super::kit::card_bg(&p));
         let mut y = card.top() + 1.0;
         let mut changed: Option<(String, bool)> = None;
         for (k, ((title, note, on, enabled, which), h)) in rows.into_iter().zip(heights).enumerate() {
             let row = Rect::from_min_size(pos2(card.left(), y), vec2(card.width(), h));
             if k > 0 {
-                ui.painter().hline(row.x_range(), row.top(), Stroke::new(1.0, p.border));
+                ui.painter().hline((row.left() + 12.0)..=(row.right() - 12.0), row.top(), Stroke::new(1.0, p.border.gamma_multiply(0.7)));
             }
             let sub = (1..=3).contains(&which);
             let indent = if sub { if full { 26.0 } else { 20.0 } } else { 12.0 };
@@ -612,15 +732,13 @@ impl CodaApp {
             self.set_rules(rules);
             self.note(format!("{title}: {}", if now_on { "on" } else { "off" }), Some(Undo::Rules(before)));
         }
-        // RESHUFFLE and the hint, 12 under the card.
+        // RESHUFFLE, 12 under the card.
         let can = self.playback.track.is_some() && self.current_shuffle();
         let at = pos2(left, card.bottom() + 12.0);
         let resp = fin::text_button(ui, &p, at, Id::new("panel-reshuffle"), "Reshuffle", Some("refresh"), false, can);
-        let hint_x = resp.rect.right() + 10.0;
         if resp.on_hover_text("Shuffle the songs still to come again (R)").clicked() && can {
             self.reshuffle();
         }
-        ui.painter().text(pos2(hint_x, at.y + 14.0), Align2::LEFT_CENTER, "Ctrl+D hides the record", regular(11.0), p.text_weak);
     }
 }
 
@@ -644,6 +762,25 @@ mod tests {
 
     fn lines(starts: &[u32]) -> Vec<LyricLine> {
         starts.iter().map(|&s| LyricLine { start_ms: s, words: format!("at {s}") }).collect()
+    }
+
+    #[test]
+    fn only_the_up_next_rows_in_view_are_drawn() {
+        // 12,000 songs from y 100; the view shows 300..700.
+        let view = egui::Rangef::new(300.0, 700.0);
+        assert_eq!(visible_rows(100.0, 12_000, view), 5..16);
+        assert_eq!(visible_rows(100.0, 3, view), 3..3, "all above the view");
+        assert_eq!(visible_rows(900.0, 10, view), 0..0, "all below it");
+        assert_eq!(visible_rows(650.0, 10, view), 0..3);
+    }
+
+    #[test]
+    fn a_dragged_row_goes_to_the_row_under_the_pointer() {
+        assert_eq!(drop_row(100.0, 10, 100.0), 0);
+        assert_eq!(drop_row(100.0, 10, 179.0), 1);
+        assert_eq!(drop_row(100.0, 10, 50.0), 0, "above the first: the first");
+        assert_eq!(drop_row(100.0, 10, 5_000.0), 9, "below the last: the last");
+        assert_eq!(drop_row(100.0, 0, 120.0), 0);
     }
 
     #[test]

@@ -30,6 +30,12 @@ use crate::ui::{MiddleTab, TRACK_FILTER_ID, CodaApp};
 const PAD_X: f32 = 24.0;
 const HERO_TOP: f32 = 22.0;
 const HERO_BOTTOM: f32 = 18.0;
+
+/// How much taller than a `cs` sleeve the words beside it are (the kind `kind_h` tall, the name, the
+/// details and the buttons, standing on the sleeve's foot): the sleeve moves down that much.
+fn hero_rise(cs: f32, kind_h: f32) -> f32 {
+    (kind_h + 4.0 + 31.5 + 6.0 + 19.0 + 14.0 + 28.0 + 2.0 - cs).max(0.0)
+}
 /// The back row above a narrow page's hero (`.from`).
 const NARROW_BACK_H: f32 = 44.0;
 /// Split: the hero's column.
@@ -139,10 +145,10 @@ impl Cols {
     }
 }
 
-/// A caption in the table's head (`.th`: 10 px semibold capitals spaced .08em).
+/// A caption in the table's head (`.th`): 11.5 px medium words as written.
 fn head_caps(ui: &Ui, text: &str) -> Arc<egui::Galley> {
     let p = crate::ui::theme::palette(ui.ctx());
-    fin::spaced(ui, &text.to_uppercase(), bold(10.0), p.text_weak, 0.8)
+    fin::spaced(ui, text, medium(11.5), p.text_weak, 0.0)
 }
 
 /// One line of `font` text in `color`, cut with "…" at `width`, spaced by `spacing`.
@@ -173,15 +179,17 @@ type HeroNumbers = (Option<usize>, u64, LikesWaiting);
 /// The hover tip of the likes waiting.
 const WAITING_TIP: &str = "Spotify is slowing likes down. coda keeps sending them.";
 
-/// The details after the owner: "1,001 songs · 38 h 55 min", an artist's "10 popular songs",
+/// The details after the owner: "12 likes · 1,001 songs · 38 h 55 min" (likes: a playlist's, when
+/// Spotify says), an artist's "10 popular songs",
 /// Liked Songs' "36,864 songs · 1,240 waiting" (no length when `tight`).
-fn meta_rest(source: &Source, (count, ms, waiting): HeroNumbers, tight: bool) -> String {
+fn meta_rest(source: &Source, (count, ms, waiting): HeroNumbers, likes: Option<u32>, tight: bool) -> String {
+    let likes = likes.map(|n| format!("{} like{}", fmt_thousands(n as usize), if n == 1 { "" } else { "s" }));
     let songs = count.map(|n| match source {
         Source::Artist(_) => format!("{n} popular song{}", if n == 1 { "" } else { "s" }),
         _ => format!("{} song{}", fmt_thousands(n), if n == 1 { "" } else { "s" }),
     });
     let waiting = Some(waiting_text(waiting)).filter(|w| !w.is_empty());
-    songs.into_iter().chain(waiting).chain((ms > 0 && !tight).then(|| fmt_total(ms))).collect::<Vec<_>>().join(" · ")
+    likes.into_iter().chain(songs).chain(waiting).chain((ms > 0 && !tight).then(|| fmt_total(ms))).collect::<Vec<_>>().join(" · ")
 }
 
 /// "1,240 waiting · 12 to remove"; nothing when none wait.
@@ -206,6 +214,12 @@ fn split_year(subtitle: &str) -> (&str, Option<&str>) {
         Some((who, year)) if year.len() == 4 && year.chars().all(|c| c.is_ascii_digit()) => (who, Some(year)),
         _ => (subtitle, None),
     }
+}
+
+/// Of `n` song rows `row_h` tall from `top`, the place a song let go at height `y` goes to (the
+/// first or the last beyond them).
+fn reorder_target(top: f32, row_h: f32, n: usize, y: f32) -> usize {
+    (((y - top) / row_h).floor().max(0.0) as usize).min(n.saturating_sub(1))
 }
 
 /// The rows (first, past the last) that show between `top` and `bottom`, for rows from `rows_top`.
@@ -370,14 +384,17 @@ impl CodaApp {
         };
         // SHUFFLE and LEFT on a playlist's page, when there is room for them (tiles when split).
         let here = self.playback.track.is_some() && self.playback.source.as_ref() == Some(&source);
-        let stats = if !album && !artist && (at.split || mw >= 760.0) { self.hero_stats(&source, here) } else { Vec::new() };
+        // The side panel says "Song 706 of 890 · 184 to go" for the list playing: each fact once.
+        let panel_says = here && self.frame_layout(ui.ctx().content_rect().width()).panel_w > 0.0;
+        let stats = if !album && !artist && !panel_says && (at.split || mw >= 760.0) { self.hero_stats(&source, here) } else { Vec::new() };
         // An artist's hero has 16 below (`pgArtist`).
+        let kind_h = ui.fonts_mut(|f| f.row_height(&medium(12.0)));
         let hero_h = if at.split {
             split_hero_h(cs, ui.fonts_mut(|f| f.row_height(&bold(10.5))), stats.len())
         } else if narrow {
             NARROW_BACK_H + 4.0 + cs + 12.0 + 28.0 + 10.0
         } else {
-            HERO_TOP + cs + if artist { 16.0 } else { HERO_BOTTOM }
+            HERO_TOP + hero_rise(cs, kind_h) + cs + if artist { 16.0 } else { HERO_BOTTOM }
         };
         let scroll_to = self.view.as_mut().and_then(|v| v.scroll_to_row.take());
         // Compact lists (Settings): shorter rows.
@@ -463,8 +480,12 @@ impl CodaApp {
         }
         let cover = if narrow {
             Rect::from_min_size(pos2(hero.left() + 18.0, hero.top() + NARROW_BACK_H + 4.0), vec2(cs, cs))
-        } else {
+        } else if at.split {
             Rect::from_min_size(pos2(at.hero.0, hero.top() + HERO_TOP), vec2(cs, cs))
+        } else {
+            // A small sleeve stands lower, so the words standing on its foot keep HERO_TOP above them.
+            let rise = hero_rise(cs, ui.fonts_mut(|f| f.row_height(&medium(12.0))));
+            Rect::from_min_size(pos2(at.hero.0, hero.top() + HERO_TOP + rise), vec2(cs, cs))
         };
         let editable = info.editable_uri.clone();
         let cover_resp = ui.interact(cover, Id::new("list-hero-cover"), if editable.is_some() { Sense::click() } else { Sense::hover() });
@@ -508,17 +529,18 @@ impl CodaApp {
         let (title_size, title_line) = if narrow { (24.0, 25.2) } else { (30.0, 31.5) };
         // The owner, then the rest: its numbers roll when they change (a like on Liked Songs).
         let (owner, numbers) = self.hero_meta(info, source);
+        let likes = self.hero_likes(source);
         let meta = meta_line(ui, &owner, "", ink, tw);
         let meta_w = meta.size().x;
         let rest = |v, ink| {
-            let rest = meta_rest(source, v, mw < 560.0);
+            let rest = meta_rest(source, v, likes, mw < 560.0);
             // After a long owner cut short, nothing.
             let rest = if owner.is_empty() || rest.is_empty() { rest } else if tw - meta_w < 12.0 { String::new() } else { format!(" · {rest}") };
             meta_line(ui, "", &rest, ink, (tw - meta_w).max(1.0))
         };
         let line_h = meta.size().y.max(rest(numbers, ink).size().y);
         let title = spaced_line(ui, &info.title, heavy(title_size), ink.strong, tw, -0.02 * title_size);
-        let kind = fin::spaced(ui, &self.hero_kind(info, source).to_uppercase(), bold(10.5), ink.weak, 1.05);
+        let kind = fin::spaced(ui, &self.hero_kind(info, source), medium(12.0), ink.weak, 0.0);
         let words_h = kind.size().y + 4.0 + title_line + 6.0 + 19.0;
         let (acts_at, meta_top) = if narrow {
             let top = cover.center().y - words_h / 2.0;
@@ -583,6 +605,7 @@ impl CodaApp {
                 .unwrap_or_default(),
             Source::Playlist(uri) => self
                 .playlist(uri)
+                .or_else(|| self.playlist_details.get(uri).and_then(|d| d.summary.as_ref()))
                 .filter(|p| !p.owner_id.is_empty() && !info.owner.is_empty())
                 .map(|p| vec![(info.owner.clone(), MetaLink::Owner(p.owner_id.clone()))])
                 .unwrap_or_default(),
@@ -629,6 +652,7 @@ impl CodaApp {
             }
             Source::LikedSongs if self.prefs.liked_pinned => "Playlist · pinned".to_owned(),
             Source::LikedSongs => "Playlist".to_owned(),
+            Source::Playlist(uri) if self.link_playlist(uri).is_some() => info.kind.to_owned(),
             Source::Playlist(uri) if self.prefs.pinned_playlists.contains(uri) => "Playlist · pinned".to_owned(),
             Source::Playlist(_) if info.editable_uri.is_none() && !info.owner.is_empty() => "Playlist · shared".to_owned(),
             Source::Artist(uri) if self.followed.contains(uri) => "Artist · following".to_owned(),
@@ -657,6 +681,25 @@ impl CodaApp {
         (owner, (count, ms, waiting))
     }
 
+    /// How many people saved this playlist, when Spotify said (none for one of the account's
+    /// listen-along links: nobody saves those).
+    fn hero_likes(&self, source: &Source) -> Option<u32> {
+        match source {
+            Source::Playlist(uri) if self.link_playlist(uri).is_none() => self.playlist_details.get(uri).and_then(|d| d.likes),
+            _ => None,
+        }
+    }
+
+    /// What the page's Delete does, and its word: a link playlist's goes with its link; one of the
+    /// user's own is deleted; another one leaves the library.
+    fn hero_delete(&self, source: &Source) -> Option<(String, &'static str)> {
+        let Source::Playlist(uri) = source else { return None };
+        if self.link_playlist(uri).is_some() {
+            return Some((uri.clone(), "Delete link"));
+        }
+        self.playlist(uri).map(|pl| (uri.clone(), if pl.editable { "Delete playlist" } else { "Remove from library" }))
+    }
+
     /// PLAY / PAUSE, RESHUFFLE, pin, edit and more (`.hero .acts`), then `stats` (SHUFFLE and LEFT)
     /// when wide. Returns what was asked for.
     #[allow(clippy::too_many_arguments)]
@@ -680,13 +723,14 @@ impl CodaApp {
             act = Some(if fresh { HeroAct::InOrder } else { HeroAct::Play(state) });
         }
         x = play.rect.right() + 8.0;
-        let icon_at = |x: f32| Rect::from_min_size(pos2(x, at.y - 1.0), vec2(30.0, 30.0));
+        // Round grey buttons as tall as the text buttons beside them.
+        let icon_at = |x: f32| Rect::from_min_size(pos2(x, at.y), vec2(28.0, 28.0));
         if browse {
-            let look = if can_play { Look::Plain } else { Look::Dim };
+            let look = if can_play { Look::Pill } else { Look::Dim };
             if fin::ib(ui, p, icon_at(x), Id::new("hero-shuffle"), "shuffle", look, "Shuffle play").clicked() {
                 act = Some(HeroAct::NewRound);
             }
-            x += 30.0 + 8.0;
+            x += 28.0 + 8.0;
             // An artist: FOLLOW, or FOLLOWING with a check (once Coda knows who is followed), when
             // there is room for it and More after it; else it is in More.
             if let Source::Artist(uri) = source
@@ -705,7 +749,7 @@ impl CodaApp {
                 }
             }
             if matches!(source, Source::Album(_)) {
-                let add = fin::ib(ui, p, icon_at(x), Id::new("hero-add"), "plus", Look::Plain, "Add to playlist");
+                let add = fin::ib(ui, p, icon_at(x), Id::new("hero-add"), "plus", Look::Pill, "Add to playlist");
                 let mine: Vec<(String, String)> = self.playlists.iter().filter(|pl| pl.editable).map(|pl| (pl.uri.clone(), pl.name.clone())).collect();
                 Popup::menu(&add).show(|ui| {
                     ui.set_width(214.0);
@@ -723,7 +767,7 @@ impl CodaApp {
                         }
                     });
                 });
-                x += 30.0 + 8.0;
+                x += 28.0 + 8.0;
             }
         } else {
             let tip = if here { "Reshuffle the songs still to come (R)" } else { "Play in a fresh random order" };
@@ -732,6 +776,40 @@ impl CodaApp {
                 act = Some(HeroAct::Reshuffle);
             }
             x = re.rect.right() + 8.0;
+            // A listen-along link: its Delete shows (nothing plays from it).
+            if let Source::Playlist(uri) = source
+                && self.link_playlist(uri).is_some()
+            {
+                let del = fin::text_button(ui, p, pos2(x, at.y), Id::new("hero-delete-link"), "Delete link", Some("x"), false, true)
+                    .on_hover_text("The link stops working and leaves your links");
+                if del.clicked() {
+                    act = Some(HeroAct::Delete(uri.clone()));
+                }
+                x = del.rect.right() + 8.0;
+            }
+            // Someone else's playlist that isn't in the library (from a search, a profile or a
+            // link): ADD TO LIBRARY (a + alone when there's no room).
+            if let Source::Playlist(uri) = source
+                && self.library_loaded
+                && self.playlist(uri).is_none()
+                && self.link_playlist(uri).is_none()
+            {
+                let waiting = self.adding_playlist.as_ref().is_some_and(|(u, at)| u == uri && at.elapsed().as_secs() < 8);
+                let (word, tip) = ("Add to library", "Add this playlist to your library");
+                let clicked = if x + fin::text_button_w(ui, word, true) + 8.0 + 30.0 <= right {
+                    let b = fin::text_button(ui, p, pos2(x, at.y), Id::new("hero-add-library"), word, Some("plus"), false, !waiting).on_hover_text(tip);
+                    x = b.rect.right() + 8.0;
+                    b.clicked()
+                } else {
+                    let look = if waiting { Look::Dim } else { Look::Pill };
+                    let b = fin::ib(ui, p, icon_at(x), Id::new("hero-add-library"), "plus", look, tip);
+                    x += 28.0 + 8.0;
+                    b.clicked() && !waiting
+                };
+                if clicked {
+                    act = Some(HeroAct::AddToLibrary(uri.clone()));
+                }
+            }
         }
         let pinned = match source {
             Source::LikedSongs => Some(self.prefs.liked_pinned),
@@ -740,24 +818,25 @@ impl CodaApp {
         };
         if let Some(pinned) = pinned.filter(|_| mw >= 560.0) {
             let tip = if pinned { "Unpin" } else { "Pin to the top" };
-            if fin::ib(ui, p, icon_at(x), Id::new("hero-pin"), "pin", Look::on(pinned), tip).clicked() {
+            if fin::ib(ui, p, icon_at(x), Id::new("hero-pin"), "pin", Look::pill(pinned), tip).clicked() {
                 act = Some(HeroAct::Pin(!pinned));
             }
-            x += 30.0 + 8.0;
+            x += 28.0 + 8.0;
         }
         let editable = match source {
             Source::Playlist(uri) => self.playlist(uri).is_some_and(|pl| pl.editable).then(|| uri.clone()),
             _ => None,
         };
         let dupes_of = editable.clone();
+        let delete = self.hero_delete(source);
         if let Some(uri) = editable.filter(|_| mw >= 760.0) {
-            if fin::ib(ui, p, icon_at(x), Id::new("hero-pen"), "pen", Look::Plain, "Edit name and description").clicked() {
+            if fin::ib(ui, p, icon_at(x), Id::new("hero-pen"), "pen", Look::Pill, "Edit name and description").clicked() {
                 act = Some(HeroAct::Edit(uri));
             }
-            x += 30.0 + 8.0;
+            x += 28.0 + 8.0;
         }
-        let more = fin::ib(ui, p, icon_at(x), Id::new("hero-more"), "more", Look::Plain, "More");
-        x += 30.0;
+        let more = fin::ib(ui, p, icon_at(x), Id::new("hero-more"), "more", Look::Pill, "More");
+        x += 28.0;
         let banner_set = self.prefs.banners.contains_key(&source.cache_key());
         let picking = self.wallpaper.banners.picking();
         Popup::menu(&more).show(|ui| {
@@ -791,6 +870,13 @@ impl CodaApp {
                 act = Some(HeroAct::Reload);
                 ui.close();
             }
+            // Playlists, albums and artists have a page on Spotify; Liked Songs and mixes don't.
+            if let Source::Playlist(uri) | Source::Album(uri) | Source::Artist(uri) = source
+                && fin::menu_item(ui, Some("link"), "Copy link", None, false, true).clicked()
+            {
+                act = Some(HeroAct::CopyLink(uri.clone()));
+                ui.close();
+            }
             // One of the user's own playlists.
             if let Some(uri) = &dupes_of
                 && fin::menu_item(ui, Some("search"), "Find duplicates", None, false, true).clicked()
@@ -801,13 +887,21 @@ impl CodaApp {
             if let Some(chosen) = banner_items(ui, banner_set, picking) {
                 act = Some(HeroAct::Banner(chosen));
             }
+            if let Some((uri, word)) = &delete {
+                fin::menu_sep(ui);
+                if fin::menu_item(ui, Some("x"), word, None, false, true).clicked() {
+                    act = Some(HeroAct::Delete(uri.clone()));
+                    ui.close();
+                }
+            }
         });
 
         // SHUFFLE and LEFT (`.stat`), when there is room (a playlist's page).
         if mw >= 760.0 && !browse {
             x += 8.0;
             for (label, value, small) in stats {
-                let lg = fin::spaced(ui, label, bold(9.5), p.text_weak, 0.95);
+                let word = if *label == "SHUFFLE" { "Shuffle" } else { "Left" };
+                let lg = fin::spaced(ui, word, medium(11.0), p.text_weak, 0.0);
                 let vg = ui.painter().layout_no_wrap(fmt_thousands(*value), bold(13.0), p.text_strong);
                 let sg = ui.painter().layout_no_wrap(small.clone(), medium(11.0), p.text_weak);
                 let w = 12.0 + lg.size().x.max(vg.size().x + 4.0 + sg.size().x) + 12.0;
@@ -873,13 +967,20 @@ impl CodaApp {
             HeroAct::Edit(uri) => self.open_edit_details(&uri),
             HeroAct::FromStart => {
                 let shuffle = self.current_shuffle();
-                self.send(Command::PlaySource { source: source.clone(), start_index: Some(0), shuffle });
+                let start = (!self.list_sorted(source)).then_some(0);
+                self.play_list(source, start, shuffle);
             }
-            HeroAct::InOrder => self.send(Command::PlaySource { source: source.clone(), start_index: None, shuffle: false }),
+            HeroAct::InOrder => self.play_list(source, None, false),
             HeroAct::NewRound => self.new_round(source),
             HeroAct::Locate => self.locate_current_track(),
             HeroAct::Reload => self.open_source(source.clone(), true),
+            HeroAct::CopyLink(uri) => self.copy_link(&uri),
+            HeroAct::AddToLibrary(uri) => {
+                self.adding_playlist = Some((uri.clone(), std::time::Instant::now()));
+                self.send(Command::AddPlaylist { uri });
+            }
             HeroAct::FindDuplicates(uri) => self.find_duplicates(&uri),
+            HeroAct::Delete(uri) => self.confirm_remove = Some(uri),
             HeroAct::Banner(b) => self.banner_act(ui.ctx(), source, b),
             HeroAct::Follow(follow) => {
                 if let Source::Artist(uri) = source {
@@ -905,11 +1006,11 @@ impl CodaApp {
         }
     }
 
-    /// The bar under the hero (`.tbar`): the Songs and Blocked tabs with their counts, and the filter.
+    /// The bar under the hero (`.tbar`): the Songs and Blocked tabs (chips) with their counts, the sort
+    /// drop-down and the filter.
     fn list_tbar(&mut self, ui: &mut Ui, bar: Rect, mw: f32, pad: f32) {
         let p = self.palette;
         let painter = ui.painter().clone();
-        painter.hline(bar.x_range(), bar.bottom() - 0.5, Stroke::new(1.0, p.border));
         let (songs, blocked_here, updating) = match self.view.as_ref() {
             Some(v) => {
                 let tracks = v.tracks.as_deref().map_or(&[][..], |t| &t[..]);
@@ -920,43 +1021,78 @@ impl CodaApp {
             None => (0, 0, None),
         };
         let key = self.view.as_ref().map(|v| v.source.cache_key()).unwrap_or_default();
-        let mut x = bar.left() + pad;
-        let mut under = None;
-        for (k, (tab, name, count)) in [(MiddleTab::Songs, "Songs", songs), (MiddleTab::Blocked, "Blocked", blocked_here)].into_iter().enumerate() {
-            let on = (self.middle_tab == MiddleTab::Blocked) == (tab == MiddleTab::Blocked);
-            let ng = ui.painter().layout_no_wrap(name.to_owned(), if on { bold(12.0) } else { medium(12.0) }, Color32::PLACEHOLDER);
-            let cg = ui.painter().layout_no_wrap(fmt_thousands(count), medium(10.5), p.text_weak);
-            let w = ng.size().x + 5.0 + cg.size().x;
-            let rect = Rect::from_min_size(pos2(x, bar.top()), vec2(w, bar.height()));
-            let resp = ui.interact(rect, Id::new(("list-tab", name)), Sense::click()).on_hover_cursor(CursorIcon::PointingHand);
-            let color = motion::color(ui.ctx(), resp.id, fin::tab_ink(&p, on, resp.hovered()), motion::HOVER);
-            let base = bar.center().y + ng.size().y / 2.0;
-            painter.galley(pos2(x, bar.center().y - ng.size().y / 2.0), ng.clone(), color);
+        let tabs = [(MiddleTab::Songs, "Songs", songs), (MiddleTab::Blocked, "Blocked", blocked_here)];
+        let chosen = usize::from(self.middle_tab == MiddleTab::Blocked);
+        let galleys = tabs.map(|(_, name, count)| {
+            let ng = ui.painter().layout_no_wrap(name.to_owned(), fin::tab_chip_font(), Color32::PLACEHOLDER);
+            let cg = ui.painter().layout_no_wrap(fmt_thousands(count), medium(10.5), Color32::PLACEHOLDER);
+            (ng, cg.size().x)
+        });
+        let widths = galleys.each_ref().map(|(ng, cw)| ng.size().x + 5.0 + cw);
+        let chips = fin::tab_chips(ui, &p, Id::new("list-tabs"), bar.left() + pad, bar.center().y, f32::INFINITY, &widths, Some(chosen));
+        for (((tab, name, count), (ng, _)), chip) in tabs.into_iter().zip(galleys).zip(chips) {
+            let x = chip.rect.left() + chip.pad;
+            let base = chip.rect.center().y + ng.size().y / 2.0;
+            painter.galley_with_override_text_color(pos2(x, chip.rect.center().y - ng.size().y / 2.0), ng.clone(), chip.ink);
             // The count rolls when it changes (this list's: another list's is just there).
             let at = pos2(x + ng.size().x + 5.0, base - 0.5);
-            motion::count(&painter, Id::new(("list-tab-count", name, &key)), count, at, Align2::LEFT_BOTTOM, |n| painter.layout_no_wrap(fmt_thousands(n), medium(10.5), p.text_weak));
-            if on {
-                under = Some((k, Rect::from_min_max(pos2(x, bar.bottom() - 2.0), pos2(x + w, bar.bottom() + 1.0))));
-            }
-            if resp.clicked() {
+            let ci = chip.count_ink;
+            motion::count(&painter, Id::new(("list-tab-count", name, &key)), count, at, Align2::LEFT_BOTTOM, |n| painter.layout_no_wrap(fmt_thousands(n), medium(10.5), ci));
+            if chip.resp.clicked() {
                 self.middle_tab = tab;
             }
-            x += w + 18.0;
         }
-        // The line slides to the tab picked.
-        motion::marker(ui.ctx(), Id::new("list-tab-line"), bar.min, under, motion::TAB, |line, a| {
-            painter.rect_filled(line, CornerRadius { nw: 2, ne: 2, sw: 0, se: 0 }, p.accent_ink.gamma_multiply(a));
-        });
 
         let fw = if mw < 560.0 { 120.0 } else if mw < 760.0 { 140.0 } else { 220.0 };
         let fr = Rect::from_min_size(pos2(bar.right() - pad - fw, bar.center().y - 14.0), vec2(fw, 28.0));
+        // The sort drop-down (`.b.dd`, as on Albums and Artists), left of the filter; just its icon
+        // when narrow.
+        let sort = self.view.as_ref().map(|v| v.sort).unwrap_or_default();
+        let mid = bar.center().y;
+        let word = if sort.is_own() { "Sort" } else { sort.by.label() };
+        let g = ui.painter().layout_no_wrap(word.to_owned(), medium(12.0), p.text);
+        let compact = mw < 560.0;
+        let dw = if compact { 30.0 } else { 10.0 + 13.0 + 7.0 + g.size().x + 7.0 + 13.0 + 10.0 };
+        let dd = Rect::from_min_size(pos2(fr.left() - 8.0 - dw, mid - 14.0), vec2(dw, 28.0));
+        let tip = "Sort the songs. Only here: the list on Spotify keeps its order.";
+        let resp = ui.interact(dd, Id::new("list-sort"), Sense::click()).on_hover_cursor(CursorIcon::PointingHand).on_hover_text(tip);
+        let bg = if resp.hovered() { p.widget_hover_bg } else if sort.is_own() { p.widget_bg } else { fin::acc(&p, 0.16) };
+        painter.rect_filled(dd, CornerRadius::same(14), bg);
+        let ink = if sort.is_own() { p.text } else { p.accent_ink };
+        if compact {
+            svgicon::paint(&painter, Rect::from_center_size(dd.center(), vec2(14.0, 14.0)), "sort", ink, svgicon::STROKE);
+        } else {
+            svgicon::paint(&painter, Rect::from_min_size(pos2(dd.left() + 10.0, mid - 6.5), vec2(13.0, 13.0)), "sort", ink, svgicon::STROKE);
+            painter.galley(pos2(dd.left() + 30.0, mid - g.size().y / 2.0), g, p.text);
+            svgicon::paint(&painter, Rect::from_min_size(pos2(dd.right() - 23.0, mid - 6.5), vec2(13.0, 13.0)), "chev", p.text, svgicon::STROKE);
+        }
+        let mut picked = None;
+        Popup::menu(&resp).show(|ui| {
+            ui.set_width(196.0);
+            fin::menu_label(ui, "Sort by");
+            for by in crate::config::SortBy::ALL {
+                if fin::menu_item(ui, None, by.label(), None, sort.by == by, true).clicked() {
+                    picked = Some(crate::config::ListSort { by, reverse: sort.reverse });
+                    ui.close();
+                }
+            }
+            fin::menu_sep(ui);
+            if fin::menu_item(ui, Some("sort"), "Reverse order", None, sort.reverse, true).clicked() {
+                picked = Some(crate::config::ListSort { reverse: !sort.reverse, ..sort });
+                ui.close();
+            }
+        });
+        if let Some(s) = picked {
+            self.set_list_sort(s);
+        }
+        let fr_text = dd;
         if let Some((loaded, total)) = updating {
             // Refreshing a list already shown: how far, left of the filter.
             let text = match total {
                 Some(t) if t > 0 => format!("Updating {} / {}", fmt_thousands(loaded.min(t)), fmt_thousands(t)),
                 _ => "Updating…".to_owned(),
             };
-            painter.text(pos2(fr.left() - 12.0, bar.center().y), Align2::RIGHT_CENTER, text, regular(11.0), p.text_weak);
+            painter.text(pos2(fr_text.left() - 12.0, bar.center().y), Align2::RIGHT_CENTER, text, regular(11.0), p.text_weak);
         }
         let Some(view) = self.view.as_mut() else { return };
         let before = view.filter.clone();
@@ -1135,9 +1271,64 @@ impl CodaApp {
             // Dragging a song that isn't picked picks it, as clicking it would.
             actions.push(RowAction::Select(ti));
         }
+        // One of the user's own playlists in its own order (not sorted, not filtered): a song
+        // dragged within it moves there.
+        let editable = matches!(source, Source::Playlist(u) if self.playlist(u).is_some_and(|pl| pl.editable));
+        let own = self.view.as_ref().is_some_and(|v| v.sort.is_own() && v.filter.trim().is_empty());
+        if editable && own && !blocked_tab && rows.len() == tracks.len() && moving.closing.is_empty() && moving.opening.is_empty() {
+            let area = Rect::from_min_max(pos2(inner.left(), rows_top), pos2(inner.right(), rows_top + rows.len() as f32 * row_h));
+            self.list_reorder(ui, dragged, source, area, row_h, &tracks);
+        }
         self.list_keys(ui, &rows, &tracks, source, &mut actions);
-        self.paint_songs_drag(ui, &tracks);
         self.apply_row_actions(ui, actions, &tracks, source, &rows);
+    }
+
+    /// A song of one of the user's playlists being dragged (`started` this pass: its place) among
+    /// its rows (`area`, `row_h` each): a line shows where it goes, and let go over the rows it
+    /// moves there. Let go elsewhere (on a playlist) it was only dragged there. Near the page's
+    /// top or bottom edge, the page scrolls.
+    fn list_reorder(&mut self, ui: &Ui, started: Option<usize>, source: &Source, area: Rect, row_h: f32, tracks: &Arc<Vec<TrackInfo>>) {
+        let id = Id::new(("list-reorder", source.cache_key()));
+        if let Some(from) = started {
+            ui.ctx().data_mut(|d| d.insert_temp(id, from));
+        }
+        let Some(from) = ui.ctx().data(|d| d.get_temp::<usize>(id)) else { return };
+        let (down, released, pointer, esc) = ui.input(|i| (i.pointer.primary_down(), i.pointer.any_released(), i.pointer.latest_pos(), i.key_pressed(egui::Key::Escape)));
+        if esc || (!down && !released) || from >= tracks.len() {
+            ui.ctx().data_mut(|d| d.remove::<usize>(id));
+            return;
+        }
+        super::super::dnd::edge_scroll(ui);
+        let Some(at) = pointer else { return };
+        let over = ui.clip_rect().contains(at) && area.expand2(vec2(0.0, row_h / 2.0)).contains(at);
+        let to = reorder_target(area.top(), row_h, tracks.len(), at.y);
+        if released {
+            ui.ctx().data_mut(|d| d.remove::<usize>(id));
+            if over && to != from {
+                self.move_in_playlist(source, tracks, from, to);
+            }
+            return;
+        }
+        if over && to != from {
+            // Under the row it takes the place of when moving down, else over it.
+            let k = if to > from { to + 1 } else { to };
+            let y = area.top() + k as f32 * row_h;
+            ui.painter().hline(area.x_range(), y, Stroke::new(2.0, self.palette.accent_ink));
+        }
+    }
+
+    /// Shows a song of one of the user's playlists at its new place at once, and asks Spotify to
+    /// move it there (put back with a note if that fails).
+    fn move_in_playlist(&mut self, source: &Source, tracks: &Arc<Vec<TrackInfo>>, from: usize, to: usize) {
+        let Source::Playlist(uri) = source else { return };
+        let mut moved = (**tracks).clone();
+        let t = moved.remove(from);
+        moved.insert(to, t);
+        if let Some(v) = self.view.as_mut().filter(|v| v.source == *source) {
+            v.set_tracks(Arc::new(moved));
+            v.selected = Some(to);
+        }
+        self.send(Command::MovePlaylistSong { playlist_uri: uri.clone(), before: tracks.clone(), from, to });
     }
 
     /// The rows closing and opening in this pass as songs went or came (see `Moves`): the room each
@@ -1199,9 +1390,10 @@ impl CodaApp {
         let is_blocked = self.blocked.contains(&t.uri);
         let is_liked = self.liked.contains(&t.uri);
         let dim = !t.playable || is_blocked;
-        // Rows can be dragged (onto a playlist, to add the song there); on a touch screen a drag
-        // scrolls the list instead.
-        let sense = if ui.input(|i| i.has_touch_screen()) { Sense::click() } else { Sense::click_and_drag() };
+        // Rows can be dragged (onto a playlist, to add the song there); a finger on a touch screen
+        // scrolls the list instead. (Not "has a touch screen": that stays true after one touch and
+        // stopped mouse drags too.)
+        let sense = if ui.input(|i| i.any_touches()) { Sense::click() } else { Sense::click_and_drag() };
         let resp = ui.interact(rect, Id::new(("song-row", ti)), sense);
         let painter = ui.painter().clone();
         if current || resp.hovered() {
@@ -1299,12 +1491,17 @@ impl CodaApp {
                 .interact(hr, Id::new(("row-heart", ti)), Sense::click())
                 .on_hover_cursor(CursorIcon::PointingHand)
                 .on_hover_text(if is_liked { "Unlike" } else { "Like" });
-            // Kept per song: another list's row in this place has its own.
-            let line = motion::color(ui.ctx(), Id::new(("row-heart-line", &t.uri, ti)), if is_liked { p.accent_ink } else if r.hovered() { p.text } else { p.text_faint }, motion::HOVER);
+            // A liked song's heart is grey until its row is pointed at or playing: on a list of liked
+            // songs the accent would otherwise repeat on every line. Kept per song: another list's
+            // row in this place has its own.
+            let hot = r.hovered() || resp.contains_pointer() || current;
+            let ink = if hot { p.accent_ink } else { p.text_weak };
+            let line = motion::color(ui.ctx(), Id::new(("row-heart-line", &t.uri, ti)), if is_liked { ink } else if r.hovered() { p.text } else { p.text_faint }, motion::HOVER);
+            let ink = motion::color(ui.ctx(), Id::new(("row-heart-ink", &t.uri, ti)), ink, motion::HOVER);
             // It pops when liked, dips when unliked: this song's heart only.
             let (scale, fill) = motion::heart(ui.ctx(), Id::new(("row-heart-pop", &t.uri)), is_liked);
             let icon = Rect::from_center_size(hr.center(), vec2(sz.heart, sz.heart));
-            motion::scaled(ui, hr.center(), scale, || fin::paint_heart(&painter, icon, line, p.accent_ink, fill));
+            motion::scaled(ui, hr.center(), scale, || fin::paint_heart(&painter, icon, line, ink, fill));
             if r.clicked() {
                 actions.push(RowAction::Like(t.uri.clone(), !is_liked));
             }
@@ -1320,10 +1517,10 @@ impl CodaApp {
                 Some(v.picked.iter().filter_map(|&i| tracks.get(i)).filter(|t| !t.is_local).map(|t| t.uri.clone()).collect::<Vec<_>>())
             });
             match picks {
-                Some(uris) if !uris.is_empty() => resp.dnd_set_drag_payload(SongsDrag { uris }),
+                Some(uris) if !uris.is_empty() => resp.dnd_set_drag_payload(SongsDrag::many(uris, None)),
                 Some(_) => {}
                 None if !t.is_local => {
-                    resp.dnd_set_drag_payload(SongsDrag { uris: vec![t.uri.clone()] });
+                    resp.dnd_set_drag_payload(SongsDrag::one(t));
                     dragged = Some(ti);
                 }
                 None => {}
@@ -1390,9 +1587,11 @@ impl CodaApp {
                         v.anchor = Some(i);
                     }
                     if tracks[i].playable {
-                        self.send(Command::PlaySource { source: source.clone(), start_index: Some(i), shuffle });
+                        self.play_list(source, Some(i), shuffle);
+                    } else if tracks[i].is_local {
+                        self.toast("That's a local file. coda can't play those yet.", false);
                     } else {
-                        self.toast("That song can't be played (it's a local file or not available on Spotify).", false);
+                        self.toast("Spotify says that song doesn't exist any more.", false);
                     }
                 }
                 RowAction::Like(uri, like) => self.like_song(&uri, like),
@@ -1544,7 +1743,6 @@ impl CodaApp {
             actions.push(RowAction::Select(ti));
         }
         ui.set_opacity(was);
-        self.paint_songs_drag(ui, &tracks);
         let rows: Vec<u32> = (0..n as u32).collect();
         // The same keys as a list's (Ctrl+A, the arrows, Enter, Esc) for the songs shown.
         self.list_keys(ui, &rows, &tracks, source, &mut actions);
@@ -1583,12 +1781,9 @@ impl CodaApp {
             let r = Rect::from_min_size(pos2(x - g.size().x - 20.0, top), vec2(g.size().x + 20.0, 24.0));
             let resp = ui.interact(r, Id::new(("rel-chip", k)), Sense::click()).on_hover_cursor(CursorIcon::PointingHand);
             let on = chosen == k;
-            let fill = if on { fin::acc(&p, 0.16) } else if resp.hovered() { p.widget_hover_bg } else { p.widget_bg };
-            ui.painter().rect_filled(r, CornerRadius::same(12), fill);
-            if on {
-                ui.painter().rect_stroke(r, CornerRadius::same(12), Stroke::new(1.0, fin::acc(&p, 0.45)), StrokeKind::Inside);
-            }
-            ui.painter().text(r.center(), Align2::CENTER_CENTER, name, medium(11.0), if on { p.text_strong } else { p.text });
+            // As every chip row (Islands).
+            ui.painter().rect_filled(r, CornerRadius::same(12), fin::chip_fill(&p, on, resp.hovered() && !on));
+            ui.painter().text(r.center(), Align2::CENTER_CENTER, name, medium(11.0), fin::chip_ink(&p, on));
             if resp.clicked()
                 && let Some(v) = self.view.as_mut()
             {
@@ -1697,6 +1892,10 @@ enum HeroAct {
     NewRound,
     Locate,
     Reload,
+    /// Copy the open.spotify.com link of this playlist, album or artist.
+    CopyLink(String),
+    /// Add someone else's playlist to the library (follow it).
+    AddToLibrary(String),
     /// "Find duplicates" in this playlist (one of the user's own).
     FindDuplicates(String),
     Banner(BannerAct),
@@ -1704,6 +1903,8 @@ enum HeroAct {
     AddAll(String),
     /// Follow (or unfollow) the artist.
     Follow(bool),
+    /// Ask before deleting this playlist (or a listen-along link's), or taking it out of the library.
+    Delete(String),
 }
 
 /// The rows closing and opening in a pass, and the numbers rolling (`row_moves`).
@@ -1769,6 +1970,14 @@ mod tests {
 
     use super::*;
     use crate::ui::kit::headless::{key, move_to, press, release};
+
+    #[test]
+    fn a_song_let_go_among_the_rows_goes_to_the_row_under_it() {
+        assert_eq!(reorder_target(100.0, 38.0, 10, 100.0), 0);
+        assert_eq!(reorder_target(100.0, 38.0, 10, 100.0 + 38.0 * 3.5), 3);
+        assert_eq!(reorder_target(100.0, 38.0, 10, 80.0), 0, "just above: the first");
+        assert_eq!(reorder_target(100.0, 38.0, 10, 9_999.0), 9, "below: the last");
+    }
 
     const ROWS: [u32; 3] = [0, 1, 2];
 
@@ -2010,12 +2219,22 @@ mod tests {
         assert_eq!(waiting(0, 12), "12 to remove");
         assert_eq!(waiting(1_240, 1), "1,240 waiting · 1 to remove");
         let liked = Source::LikedSongs;
-        let rest = |waiting, tight| meta_rest(&liked, (Some(36_864), 140_100_000, waiting), tight);
+        let rest = |waiting, tight| meta_rest(&liked, (Some(36_864), 140_100_000, waiting), None, tight);
         assert_eq!(rest(LikesWaiting { likes: 1_240, unlikes: 0 }, true), "36,864 songs · 1,240 waiting");
         assert_eq!(rest(LikesWaiting { likes: 1_240, unlikes: 12 }, false), "36,864 songs · 1,240 waiting · 12 to remove · 38 h 55 min");
         assert_eq!(rest(LikesWaiting::default(), false), "36,864 songs · 38 h 55 min");
         // Before the songs are known, what waits still shows.
-        assert_eq!(meta_rest(&liked, (None, 0, LikesWaiting { likes: 1, unlikes: 0 }), false), "1 waiting");
+        assert_eq!(meta_rest(&liked, (None, 0, LikesWaiting { likes: 1, unlikes: 0 }), None, false), "1 waiting");
+    }
+
+    #[test]
+    fn a_playlists_likes_lead_its_numbers() {
+        let list = Source::Playlist("spotify:playlist:care".into());
+        let numbers = (Some(505), 90_060_000, LikesWaiting::default());
+        assert_eq!(meta_rest(&list, numbers, Some(1_204), false), "1,204 likes · 505 songs · 25 h 1 min");
+        assert_eq!(meta_rest(&list, numbers, Some(1), true), "1 like · 505 songs");
+        assert_eq!(meta_rest(&list, numbers, Some(0), true), "0 likes · 505 songs");
+        assert_eq!(meta_rest(&list, numbers, None, false), "505 songs · 25 h 1 min", "unknown: not shown");
     }
 
     #[test]
@@ -2025,7 +2244,7 @@ mod tests {
         let p = Palette::build(crate::config::ThemeMode::Light, Color32::from_rgb(30, 215, 96), None);
         let ink = Ink { strong: p.text_strong, text: p.text, weak: p.text_weak, shadow: false };
         let waiting = LikesWaiting { likes: 10_000, unlikes: 12 };
-        let rest = format!(" · {}", meta_rest(&Source::LikedSongs, (Some(36_864), 2_100 * 3_600_000, waiting), false));
+        let rest = format!(" · {}", meta_rest(&Source::LikedSongs, (Some(36_864), 2_100 * 3_600_000, waiting), None, false));
         let mut full = 0.0;
         crate::ui::kit::headless::pass(&ctx, Vec::new(), |ui| full = meta_line(ui, "", &rest, ink, f32::INFINITY).size().x);
         assert!(full > 100.0);

@@ -373,11 +373,11 @@ fn initial_circle(ui: &Ui, pic: Rect, name: &str, dim: bool) {
     ui.painter().text(pic.center(), Align2::CENTER_CENTER, letter, bold(15.0), Color32::from_rgb(17, 17, 17).gamma_multiply(k));
 }
 
-/// A row's button (`.b`: 24 tall, 10 either side, 10 px bold capitals), ending at `right`;
+/// A row's button (`.b`: a 24 tall pill, 10 either side, 11 px semibold as written), ending at `right`;
 /// `primary` in the accent.
 fn small_button(ui: &Ui, p: &Palette, right: f32, cy: f32, id: Id, text: &str, primary: bool) -> Response {
     let color = if primary { p.on_accent } else { p.text };
-    let g = fin::spaced(ui, &text.to_uppercase(), bold(10.0), color, 0.6);
+    let g = fin::spaced(ui, text, bold(11.0), color, 0.0);
     let rect = Rect::from_min_max(pos2(right - g.size().x - 20.0, cy - 12.0), pos2(right, cy + 12.0));
     let resp = ui.interact(rect, id, Sense::click());
     let fill = match (primary, resp.hovered()) {
@@ -386,7 +386,7 @@ fn small_button(ui: &Ui, p: &Palette, right: f32, cy: f32, id: Id, text: &str, p
         (false, true) => p.widget_hover_bg,
         (false, false) => p.widget_bg,
     };
-    ui.painter().rect_filled(rect, CornerRadius::same(6), fill);
+    ui.painter().rect_filled(rect, CornerRadius::same(12), fill);
     ui.painter().galley(pos2(rect.left() + 10.0, cy - g.size().y / 2.0), g, color);
     resp.on_hover_cursor(CursorIcon::PointingHand)
 }
@@ -649,7 +649,7 @@ mod tests {
     /// The middle of the row's button (NEW LINK) with these words.
     fn button_x(ctx: &egui::Context, text: &str) -> f32 {
         let mut w = 0.0;
-        pass(ctx, Vec::new(), |ui| w = fin::spaced(ui, &text.to_uppercase(), bold(10.0), Color32::PLACEHOLDER, 0.6).size().x + 20.0);
+        pass(ctx, Vec::new(), |ui| w = fin::spaced(ui, &text, bold(11.0), Color32::PLACEHOLDER, 0.0).size().x + 20.0);
         BUTTON_RIGHT - w / 2.0
     }
 
